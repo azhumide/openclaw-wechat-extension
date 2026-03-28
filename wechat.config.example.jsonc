@@ -1,0 +1,46 @@
+{
+  // WeChat Bridge 监听地址
+  // 一般保持 0.0.0.0，表示监听所有网卡
+  "wsHost": "0.0.0.0",
+
+  // WeChat Bridge 监听端口
+  // 需要和 aibot/plugins/OpenClawBridge/config.toml 里的 ws_url 端口一致
+  "wsPort": 9093,
+
+  // WeChat Bridge 的 WebSocket 路径
+  // 需要和 aibot/plugins/OpenClawBridge/config.toml 里的 ws_url 路径一致
+  "wsPath": "/ws",
+
+  // aiBot 用来访问 OpenClaw 媒体下载服务的主机/IP
+  // 同机部署:
+  // "127.0.0.1"
+  // 跨机器/局域网部署:
+  // 写 OpenClaw 所在机器的局域网 IP，例如 "10.10.10.80"
+  "bridgeDownloadHost": "127.0.0.1",
+
+  // 可选：媒体下载完整基础地址
+  // 如果你用了域名、Nginx、HTTPS 反向代理，优先填这个
+  // 例如:
+  // "https://wechat.example.com"
+  // 留空时会自动使用 http://bridgeDownloadHost:wsPort
+  "bridgeDownloadBaseUrl": "",
+
+  // OpenClaw Workspace 根目录
+  // 建议显式填写，避免不同环境自动推断出错
+  // Linux 例子:
+  // "/home/rs/.openclaw/workspace"
+  // Windows 例子:
+  // "C:/Users/你的用户名/.openclaw/workspace"
+  "workspaceBase": "/home/rs/.openclaw/workspace",
+
+  // 可选：临时文件目录
+  // 扩展下载/中转媒体时优先使用这个目录
+  // 留空则默认使用 workspaceBase/downloads
+  "tmpDir": "",
+
+  // 可选：附加媒体搜索目录
+  // 当工具返回的是相对路径，扩展会在这些目录里继续查找文件
+  // 例子:
+  // ["/tmp/openclaw", "/data/shared_media"]
+  "mediaSearchPaths": []
+}

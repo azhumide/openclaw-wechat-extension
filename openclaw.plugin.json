@@ -1,0 +1,60 @@
+{
+  "id": "wechat",
+  "channels": [
+    "wechat"
+  ],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "wsHost": {
+        "type": "string",
+        "description": "WS bridge bind host, default 0.0.0.0"
+      },
+      "wsPort": {
+        "type": "number",
+        "description": "WS bridge bind port, default 9093"
+      },
+      "wsPath": {
+        "type": "string",
+        "description": "WS bridge path, default /ws"
+      },
+      "bridgeDownloadHost": {
+        "type": "string",
+        "description": "Bridge HTTP download host/IP, default 127.0.0.1"
+      },
+      "bridgeDownloadBaseUrl": {
+        "type": "string",
+        "description": "Full public base URL for bridge downloads, e.g. https://example.com"
+      },
+      "workspaceBase": {
+        "type": "string",
+        "description": "Workspace base path for downloads/temp files"
+      },
+      "tmpDir": {
+        "type": "string",
+        "description": "Override temp directory for inbound media"
+      },
+      "mediaSearchPaths": {
+        "type": "array",
+        "description": "Additional directories searched for relative media paths",
+        "items": {
+          "type": "string"
+        }
+      },
+      "accounts": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  }
+}
