@@ -1,5 +1,6 @@
 {
   "id": "wechat",
+  "version": "1.0.0",
   "channels": [
     "wechat"
   ],

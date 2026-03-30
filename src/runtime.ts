@@ -1,4 +1,4 @@
-import type { PluginRuntime } from "../../../openclaw/src/plugins/runtime/types-core.js";
+import type { PluginRuntime } from "openclaw/plugin-sdk/core";
 import type { WebSocket, WebSocketServer } from "ws";
 
 const globalSym = Symbol.for("openclaw.wechat.bridge.state");

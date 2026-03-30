@@ -1,4 +1,4 @@
-import type { ChannelPlugin } from "../../../../openclaw/src/channels/plugins/types.js";
+import type { ChannelPlugin } from "openclaw/plugin-sdk";
 import { getWechatRuntime, isBridgeConnected, sendToBridge } from "./runtime.js";
 import { isPathWithinRoots, resolveWechatExtensionConfig, resolveWechatMediaServeRoots } from "./config.js";
 

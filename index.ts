@@ -4,8 +4,8 @@ import { Buffer } from "buffer";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { OpenClawPluginApi } from "../../../openclaw/src/plugins/types.js";
-import { emptyPluginConfigSchema } from "../../../openclaw/src/plugins/config-schema.js";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { emptyPluginConfigSchema } from "openclaw/plugin-sdk/core";
 import { wechatPlugin } from "./src/channel.js";
 import { isPathWithinRoots, resolveWechatExtensionConfig, resolveWechatMediaServeRoots } from "./src/config.js";
 import {
@@ -595,6 +595,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                         await wechatPlugin.outbound.sendText({
                             to: from,
                             text: precedingText,
+                            msg_id: messageId,
                             accountId: accountId || "default",
                             cfg,
                         } as any);
@@ -608,6 +609,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                                 to: from,
                                 mediaUrl: mPath,
                                 text: "",
+                                msg_id: messageId,
                                 accountId: accountId || "default",
                                 cfg,
                             } as any);
@@ -621,6 +623,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                     await wechatPlugin.outbound.sendText({
                         to: from,
                         text: remainingText,
+                        msg_id: messageId,
                         accountId: accountId || "default",
                         cfg,
                     } as any);
@@ -635,6 +638,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                                 to: from,
                                 mediaUrl: mUrl,
                                 text: "",
+                                msg_id: messageId,
                                 accountId: accountId || "default",
                                 cfg,
                             } as any);
@@ -644,6 +648,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
 
                 // Update turn state
                 sentText = fullText;
+
             },
         },
     });
