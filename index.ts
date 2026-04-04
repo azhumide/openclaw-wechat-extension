@@ -527,7 +527,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         onTyping: async () => { },
     } as any);
 
-    let sentText = "";
+    let cumulativeSentText = "";
     const sentMediaPaths = new Set<string>();
 
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -563,8 +563,8 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 // 1. Identify new text relative to what we've already sent in this turn.
                 // 2. Identify new media URLs.
                 let newText = fullText;
-                if (sentText && fullText.startsWith(sentText)) {
-                    newText = fullText.substring(sentText.length).trim();
+                if (cumulativeSentText && fullText.startsWith(cumulativeSentText)) {
+                    newText = fullText.substring(cumulativeSentText.length);
                 }
 
                 const allMedia = [...(payload.mediaUrls || [])];
@@ -575,7 +575,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 // Regex-based media parsing also contributes to sentMediaPaths
                 // We'll process the full text if it's the first time, 
                 // or just the newText if it's incremental.
-                const textToProcess = (sentText && fullText.startsWith(sentText)) ? newText : fullText;
+                const textToProcess = newText;
                 
                 if (!textToProcess && !hasNewMedia && info.kind === "final") {
                     api.logger.info(`[WeChat] Skipping redundant final reply (already sent in blocks)`);
@@ -647,7 +647,9 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 }
 
                 // Update turn state
-                sentText = fullText;
+                if (textToProcess) {
+                    cumulativeSentText += textToProcess;
+                }
 
             },
         },
