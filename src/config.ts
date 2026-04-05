@@ -15,6 +15,23 @@ type PartialWechatExtensionConfig = {
     workspaceBase?: string;
     tmpDir?: string;
     mediaSearchPaths?: string[];
+    nonOwnerToolAuthMode?: "off" | "deny" | "approve";
+    nonOwnerToolAuthTools?: string[];
+    toolAuthBypassWxids?: string[];
+    toolAuthBypassByTool?: Record<string, string[]>;
+    ownerExecBypassApproval?: boolean;
+    toolAuthNotifyBlocked?: boolean;
+    toolAuthNotifyApprovalQueued?: boolean;
+    toolAuthNotifyApprovalResolved?: boolean;
+    toolAuthNotifyInGroup?: boolean;
+    toolAuthNotifyInDirect?: boolean;
+    toolAuthMessageBlocked?: string;
+    toolAuthMessageQueued?: string;
+    toolAuthMessageAllowOnce?: string;
+    toolAuthMessageAllowAlways?: string;
+    toolAuthMessageDeny?: string;
+    toolAuthMessageTimeout?: string;
+    toolAuthMessageCancelled?: string;
 };
 
 export type WechatExtensionConfig = {
@@ -26,6 +43,23 @@ export type WechatExtensionConfig = {
     workspaceBase: string;
     tmpDir: string;
     mediaSearchPaths: string[];
+    nonOwnerToolAuthMode: "off" | "deny" | "approve";
+    nonOwnerToolAuthTools: string[];
+    toolAuthBypassWxids: string[];
+    toolAuthBypassByTool: Record<string, string[]>;
+    ownerExecBypassApproval: boolean;
+    toolAuthNotifyBlocked: boolean;
+    toolAuthNotifyApprovalQueued: boolean;
+    toolAuthNotifyApprovalResolved: boolean;
+    toolAuthNotifyInGroup: boolean;
+    toolAuthNotifyInDirect: boolean;
+    toolAuthMessageBlocked?: string;
+    toolAuthMessageQueued?: string;
+    toolAuthMessageAllowOnce?: string;
+    toolAuthMessageAllowAlways?: string;
+    toolAuthMessageDeny?: string;
+    toolAuthMessageTimeout?: string;
+    toolAuthMessageCancelled?: string;
 };
 
 export const WECHAT_LOCAL_CONFIG_PATH = new URL("../wechat.config.json", import.meta.url);
@@ -46,6 +80,29 @@ function normalizeStringArray(value: unknown): string[] | undefined {
         .map((item) => item.trim())
         .filter(Boolean);
     return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeToolAuthBypassByTool(value: unknown): Record<string, string[]> | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return undefined;
+    }
+    const source = value as Record<string, unknown>;
+    const normalizedEntries = Object.entries(source)
+        .map(([toolName, toolAllowList]) => {
+            const key = toolName.trim().toLowerCase();
+            const allowList = normalizeStringArray(toolAllowList);
+            if (!key || !allowList) {
+                return undefined;
+            }
+            return [key, allowList] as const;
+        })
+        .filter((entry): entry is readonly [string, string[]] => Boolean(entry));
+
+    if (normalizedEntries.length === 0) {
+        return undefined;
+    }
+
+    return Object.fromEntries(normalizedEntries);
 }
 
 function normalizeWsPath(value: unknown): string | undefined {
@@ -69,6 +126,24 @@ function normalizePort(value: unknown): number | undefined {
     return port;
 }
 
+function normalizeBoolean(value: unknown): boolean | undefined {
+    if (typeof value === "boolean") return value;
+    if (typeof value !== "string") return undefined;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+    return undefined;
+}
+
+function normalizeNonOwnerToolAuthMode(value: unknown): "off" | "deny" | "approve" | undefined {
+    const raw = normalizeString(value);
+    if (!raw) return undefined;
+    if (raw === "off" || raw === "deny" || raw === "approve") {
+        return raw;
+    }
+    return undefined;
+}
+
 function sanitizeLocalConfig(raw: unknown): PartialWechatExtensionConfig {
     if (!raw || typeof raw !== "object") return {};
     const source = raw as Record<string, unknown>;
@@ -81,6 +156,23 @@ function sanitizeLocalConfig(raw: unknown): PartialWechatExtensionConfig {
         workspaceBase: normalizeString(source.workspaceBase),
         tmpDir: normalizeString(source.tmpDir),
         mediaSearchPaths: normalizeStringArray(source.mediaSearchPaths),
+        nonOwnerToolAuthMode: normalizeNonOwnerToolAuthMode(source.nonOwnerToolAuthMode),
+        nonOwnerToolAuthTools: normalizeStringArray(source.nonOwnerToolAuthTools),
+        toolAuthBypassWxids: normalizeStringArray(source.toolAuthBypassWxids),
+        toolAuthBypassByTool: normalizeToolAuthBypassByTool(source.toolAuthBypassByTool),
+        ownerExecBypassApproval: normalizeBoolean(source.ownerExecBypassApproval),
+        toolAuthNotifyBlocked: normalizeBoolean(source.toolAuthNotifyBlocked),
+        toolAuthNotifyApprovalQueued: normalizeBoolean(source.toolAuthNotifyApprovalQueued),
+        toolAuthNotifyApprovalResolved: normalizeBoolean(source.toolAuthNotifyApprovalResolved),
+        toolAuthNotifyInGroup: normalizeBoolean(source.toolAuthNotifyInGroup),
+        toolAuthNotifyInDirect: normalizeBoolean(source.toolAuthNotifyInDirect),
+        toolAuthMessageBlocked: normalizeString(source.toolAuthMessageBlocked),
+        toolAuthMessageQueued: normalizeString(source.toolAuthMessageQueued),
+        toolAuthMessageAllowOnce: normalizeString(source.toolAuthMessageAllowOnce),
+        toolAuthMessageAllowAlways: normalizeString(source.toolAuthMessageAllowAlways),
+        toolAuthMessageDeny: normalizeString(source.toolAuthMessageDeny),
+        toolAuthMessageTimeout: normalizeString(source.toolAuthMessageTimeout),
+        toolAuthMessageCancelled: normalizeString(source.toolAuthMessageCancelled),
     };
 }
 
@@ -133,6 +225,67 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
         normalizeStringArray(root.mediaSearchPaths) ||
         local.mediaSearchPaths ||
         [];
+    const nonOwnerToolAuthMode =
+        normalizeNonOwnerToolAuthMode(root.nonOwnerToolAuthMode) ||
+        local.nonOwnerToolAuthMode ||
+        "off";
+    const nonOwnerToolAuthTools =
+        normalizeStringArray(root.nonOwnerToolAuthTools) ||
+        local.nonOwnerToolAuthTools ||
+        ["exec", "process"];
+    const toolAuthBypassWxids =
+        normalizeStringArray(root.toolAuthBypassWxids) ||
+        local.toolAuthBypassWxids ||
+        [];
+    const toolAuthBypassByTool =
+        normalizeToolAuthBypassByTool(root.toolAuthBypassByTool) ||
+        local.toolAuthBypassByTool ||
+        {};
+    const ownerExecBypassApproval =
+        normalizeBoolean(root.ownerExecBypassApproval) ??
+        local.ownerExecBypassApproval ??
+        false;
+    const toolAuthNotifyBlocked =
+        normalizeBoolean(root.toolAuthNotifyBlocked) ??
+        local.toolAuthNotifyBlocked ??
+        true;
+    const toolAuthNotifyApprovalQueued =
+        normalizeBoolean(root.toolAuthNotifyApprovalQueued) ??
+        local.toolAuthNotifyApprovalQueued ??
+        true;
+    const toolAuthNotifyApprovalResolved =
+        normalizeBoolean(root.toolAuthNotifyApprovalResolved) ??
+        local.toolAuthNotifyApprovalResolved ??
+        true;
+    const toolAuthNotifyInGroup =
+        normalizeBoolean(root.toolAuthNotifyInGroup) ??
+        local.toolAuthNotifyInGroup ??
+        true;
+    const toolAuthNotifyInDirect =
+        normalizeBoolean(root.toolAuthNotifyInDirect) ??
+        local.toolAuthNotifyInDirect ??
+        true;
+    const toolAuthMessageBlocked =
+        normalizeString(root.toolAuthMessageBlocked) ??
+        local.toolAuthMessageBlocked;
+    const toolAuthMessageQueued =
+        normalizeString(root.toolAuthMessageQueued) ??
+        local.toolAuthMessageQueued;
+    const toolAuthMessageAllowOnce =
+        normalizeString(root.toolAuthMessageAllowOnce) ??
+        local.toolAuthMessageAllowOnce;
+    const toolAuthMessageAllowAlways =
+        normalizeString(root.toolAuthMessageAllowAlways) ??
+        local.toolAuthMessageAllowAlways;
+    const toolAuthMessageDeny =
+        normalizeString(root.toolAuthMessageDeny) ??
+        local.toolAuthMessageDeny;
+    const toolAuthMessageTimeout =
+        normalizeString(root.toolAuthMessageTimeout) ??
+        local.toolAuthMessageTimeout;
+    const toolAuthMessageCancelled =
+        normalizeString(root.toolAuthMessageCancelled) ??
+        local.toolAuthMessageCancelled;
 
     return {
         wsHost,
@@ -143,6 +296,23 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
         workspaceBase,
         tmpDir,
         mediaSearchPaths,
+        nonOwnerToolAuthMode,
+        nonOwnerToolAuthTools,
+        toolAuthBypassWxids,
+        toolAuthBypassByTool,
+        ownerExecBypassApproval,
+        toolAuthNotifyBlocked,
+        toolAuthNotifyApprovalQueued,
+        toolAuthNotifyApprovalResolved,
+        toolAuthNotifyInGroup,
+        toolAuthNotifyInDirect,
+        toolAuthMessageBlocked,
+        toolAuthMessageQueued,
+        toolAuthMessageAllowOnce,
+        toolAuthMessageAllowAlways,
+        toolAuthMessageDeny,
+        toolAuthMessageTimeout,
+        toolAuthMessageCancelled,
     };
 }
 

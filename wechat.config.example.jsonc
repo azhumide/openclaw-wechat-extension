@@ -42,5 +42,67 @@
   // 当工具返回的是相对路径，扩展会在这些目录里继续查找文件
   // 例子:
   // ["/tmp/openclaw", "/data/shared_media"]
-  "mediaSearchPaths": []
+  "mediaSearchPaths": [],
+
+  // 非主人微信发送者调用敏感工具时的策略
+  // 可选:
+  // "off"     不额外拦截
+  // "deny"    直接拒绝
+  // "approve" 先走 OpenClaw 插件审批，再继续执行
+  "nonOwnerToolAuthMode": "deny",
+
+  // 需要受上面策略保护的工具名
+  // 默认建议先保护 exec 和 process
+  "nonOwnerToolAuthTools": ["exec", "process"],
+
+  // 可选：工具权限白名单
+  // 支持 sender wxid，也支持私聊场景下 OpenClawBridge 传过来的 alias
+  // 这些值会和主人一样，跳过上面敏感工具的拒绝/审批逻辑
+  // 例子:
+  // ["wxid_xxx", "zhangsan_alias"]
+  "toolAuthBypassWxids": [],
+
+  // 可选：按工具分别配置白名单
+  // key 是工具名，value 是该工具允许跳过拒绝/审批的 wxid 或私聊 alias 列表
+  // 这个配置会和上面的全局白名单一起生效
+  // 例子:
+  // {
+  //   "process": ["wxid_xxx", "lisi_alias"],
+  //   "exec": ["wxid_owner2"]
+  // }
+  "toolAuthBypassByTool": {},
+
+  // 主人调用 exec 时，是否在微信侧先把 ask 强制改成 off
+  // 这是“尽量不弹审批”的最佳努力开关
+  // 注意:
+  // 如果主机上的 ~/.openclaw/exec-approvals.json 更严格，它仍然会继续生效
+  "ownerExecBypassApproval": false,
+
+  // 非主人直接被拒绝时，是否回一条微信提示
+  "toolAuthNotifyBlocked": true,
+
+  // 进入审批队列时，是否回一条“已提交审批”
+  "toolAuthNotifyApprovalQueued": true,
+
+  // 审批结束后，是否回一条结果提示
+  "toolAuthNotifyApprovalResolved": true,
+
+  // 群聊里是否允许发送上面的工具权限提示
+  "toolAuthNotifyInGroup": true,
+
+  // 私聊里是否允许发送上面的工具权限提示
+  "toolAuthNotifyInDirect": true,
+
+  // 可选：自定义工具权限提示文案模板
+  // 可用占位符:
+  // {{toolName}} {{state}} {{stateLabel}} {{senderId}} {{senderName}}
+  // {{from}} {{chatType}} {{chatTypeLabel}} {{conversationLabel}} {{question}}
+  // 留空则使用内置默认文案
+  "toolAuthMessageBlocked": "",
+  "toolAuthMessageQueued": "",
+  "toolAuthMessageAllowOnce": "",
+  "toolAuthMessageAllowAlways": "",
+  "toolAuthMessageDeny": "",
+  "toolAuthMessageTimeout": "",
+  "toolAuthMessageCancelled": ""
 }

@@ -9,10 +9,17 @@ import { emptyPluginConfigSchema } from "openclaw/plugin-sdk/core";
 import { wechatPlugin } from "./src/channel.js";
 import { isPathWithinRoots, resolveWechatExtensionConfig, resolveWechatMediaServeRoots } from "./src/config.js";
 import {
+    bindWechatToolAuthToRun,
+    clearWechatToolAuthForRun,
+    clearWechatToolAuthForSession,
     clearBridgeRuntimeState,
+    enqueueWechatInboundToolAuth,
     getActiveBridgeSocket,
     getBridgeLastPongAt,
     markBridgePong,
+    getWechatToolAuthForRun,
+    inheritWechatToolAuthForChildSession,
+    promoteWechatToolAuthForDispatch,
     setActiveBridgeSocket,
     setWechatRuntime,
     setWechatWsServer,
@@ -116,6 +123,323 @@ function restoreServedFilePath(rawPath: string): string {
 
 function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function collapseExactRepeatedReplyText(text: string): string {
+    const normalized = text.replace(/\r\n/g, "\n").trim();
+    if (normalized.length < 40) {
+        return normalized;
+    }
+
+    const divisors: number[] = [];
+    for (let unitLength = 20; unitLength <= Math.floor(normalized.length / 2); unitLength++) {
+        if (normalized.length % unitLength === 0) {
+            divisors.push(unitLength);
+        }
+    }
+
+    divisors.sort((a, b) => b - a);
+    for (const unitLength of divisors) {
+        const repeatCount = normalized.length / unitLength;
+        if (repeatCount < 2) {
+            continue;
+        }
+
+        const unit = normalized.slice(0, unitLength);
+        if (unit.repeat(repeatCount) === normalized) {
+            return unit.trim();
+        }
+    }
+
+    return normalized;
+}
+
+function summarizeWechatTextForLog(text: unknown, maxLength = 160): string {
+    if (typeof text !== "string") {
+        return "";
+    }
+    const normalized = text.replace(/\r\n/g, "\n").replace(/\n/g, "\\n").trim();
+    if (!normalized) {
+        return "";
+    }
+    if (normalized.length <= maxLength) {
+        return normalized;
+    }
+    return `${normalized.slice(0, maxLength)}...`;
+}
+
+function normalizeGuardedToolNameList(value: string[] | undefined): Set<string> {
+    return new Set(
+        (value || [])
+            .map((entry) => entry.trim().toLowerCase())
+            .filter(Boolean),
+    );
+}
+
+function normalizeWechatIdAllowList(value: string[] | undefined): Set<string> {
+    return new Set(
+        (value || [])
+            .map((entry) => entry.trim().toLowerCase())
+            .filter(Boolean),
+    );
+}
+
+function resolveWechatToolBypassMatch(
+    allowList: Set<string>,
+    authContext: {
+        senderId?: string;
+        from?: string;
+    },
+): { matched: boolean; kind?: "senderId" | "from"; value?: string } {
+    const senderId = authContext.senderId?.trim().toLowerCase();
+    if (senderId && allowList.has(senderId)) {
+        return {
+            matched: true,
+            kind: "senderId",
+            value: authContext.senderId,
+        };
+    }
+
+    const from = authContext.from?.trim().toLowerCase();
+    if (from && allowList.has(from)) {
+        return {
+            matched: true,
+            kind: "from",
+            value: authContext.from,
+        };
+    }
+
+    return { matched: false };
+}
+
+function getWechatToolSpecificAllowList(
+    config: ReturnType<typeof resolveWechatExtensionConfig>,
+    toolName: string,
+): Set<string> {
+    const entries = config.toolAuthBypassByTool?.[toolName] || [];
+    return normalizeWechatIdAllowList(entries);
+}
+
+function summarizeWechatToolAuthRecord(entry: {
+    from?: string;
+    chatType?: string;
+    conversationLabel?: string;
+    senderId?: string;
+    senderName?: string;
+    content?: string;
+}): string {
+    const parts: string[] = [];
+    if (entry.chatType) {
+        parts.push(`chatType=${entry.chatType}`);
+    }
+    if (entry.from) {
+        parts.push(`from=${entry.from}`);
+    }
+    if (entry.conversationLabel) {
+        parts.push(`conversation="${summarizeWechatTextForLog(entry.conversationLabel, 80)}"`);
+    }
+    if (entry.senderId) {
+        parts.push(`sender=${entry.senderId}`);
+    }
+    if (entry.senderName && entry.senderName !== entry.senderId) {
+        parts.push(`senderName="${summarizeWechatTextForLog(entry.senderName, 80)}"`);
+    }
+    if (entry.content) {
+        parts.push(`text="${summarizeWechatTextForLog(entry.content, 120)}"`);
+    }
+    return parts.join(" ");
+}
+
+type WechatToolNoticeState =
+    | "queued"
+    | "allow-once"
+    | "allow-always"
+    | "deny"
+    | "timeout"
+    | "cancelled"
+    | "blocked";
+
+type WechatToolNoticeContext = {
+    from?: string;
+    accountId?: string;
+    messageId?: string;
+    chatType?: "group" | "direct";
+    conversationLabel?: string;
+    senderId?: string;
+    senderName?: string;
+    content?: string;
+};
+
+function getWechatToolNoticeStateLabel(state: WechatToolNoticeState): string {
+    switch (state) {
+        case "queued":
+            return "已提交审批";
+        case "allow-once":
+            return "本次已批准";
+        case "allow-always":
+            return "已设为总是允许";
+        case "deny":
+            return "审批被拒绝";
+        case "timeout":
+            return "审批超时";
+        case "cancelled":
+            return "审批已取消";
+        case "blocked":
+            return "无权限";
+        default:
+            return state;
+    }
+}
+
+function getWechatChatTypeLabel(chatType?: string): string {
+    return chatType === "group" ? "群聊" : "私聊";
+}
+
+function renderWechatToolNoticeTemplate(template: string, params: {
+    toolName: string;
+    state: WechatToolNoticeState;
+    authContext: WechatToolNoticeContext;
+}): string {
+    const replacements: Record<string, string> = {
+        toolName: params.toolName,
+        state: params.state,
+        stateLabel: getWechatToolNoticeStateLabel(params.state),
+        senderId: params.authContext.senderId || "",
+        senderName: params.authContext.senderName || "",
+        from: params.authContext.from || "",
+        chatType: params.authContext.chatType || "",
+        chatTypeLabel: getWechatChatTypeLabel(params.authContext.chatType),
+        conversationLabel: params.authContext.conversationLabel || "",
+        question: params.authContext.content || "",
+    };
+    return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_match, key: string) => {
+        return replacements[key] ?? "";
+    }).trim();
+}
+
+function buildWechatToolApprovalDescription(toolName: string, authContext: {
+    from?: string;
+    accountId?: string;
+    chatType?: string;
+    conversationLabel?: string;
+    senderId?: string;
+    senderName?: string;
+    content?: string;
+}): string {
+    const location = authContext.chatType === "group"
+        ? `群 "${authContext.conversationLabel || authContext.from || "unknown"}"`
+        : "私聊";
+    const sender = authContext.senderName && authContext.senderName !== authContext.senderId
+        ? `${authContext.senderName} (${authContext.senderId || "unknown"})`
+        : (authContext.senderId || authContext.senderName || "unknown");
+    const lines = [
+        `${location} 中的微信发送者 ${sender} 请求执行工具 "${toolName}"。`,
+    ];
+    const questionPreview = summarizeWechatTextForLog(authContext.content, 200);
+    if (questionPreview) {
+        lines.push(`原始消息: ${questionPreview}`);
+    }
+    lines.push("批准一次后继续当前运行。");
+    return lines.join("\n");
+}
+
+function buildWechatToolNoticeText(params: {
+    toolName: string;
+    state: WechatToolNoticeState;
+    authContext: WechatToolNoticeContext;
+    config: ReturnType<typeof resolveWechatExtensionConfig>;
+}): string {
+    const customTemplate = (() => {
+        switch (params.state) {
+            case "queued":
+                return params.config.toolAuthMessageQueued;
+            case "allow-once":
+                return params.config.toolAuthMessageAllowOnce;
+            case "allow-always":
+                return params.config.toolAuthMessageAllowAlways;
+            case "deny":
+                return params.config.toolAuthMessageDeny;
+            case "timeout":
+                return params.config.toolAuthMessageTimeout;
+            case "cancelled":
+                return params.config.toolAuthMessageCancelled;
+            case "blocked":
+                return params.config.toolAuthMessageBlocked;
+            default:
+                return undefined;
+        }
+    })();
+    if (customTemplate) {
+        return renderWechatToolNoticeTemplate(customTemplate, params);
+    }
+
+    const toolLabel = params.toolName;
+    switch (params.state) {
+        case "queued":
+            return `检测到敏感工具申请: ${toolLabel}\n已提交审批，请稍候。`;
+        case "allow-once":
+            return `敏感工具审批已通过: ${toolLabel}\n本次执行继续进行。`;
+        case "allow-always":
+            return `敏感工具审批已设为总是允许: ${toolLabel}\n当前执行继续进行。`;
+        case "deny":
+            return `敏感工具审批被拒绝: ${toolLabel}\n本次不会执行。`;
+        case "timeout":
+            return `敏感工具审批超时: ${toolLabel}\n本次不会执行。`;
+        case "cancelled":
+            return `敏感工具审批已取消: ${toolLabel}\n本次不会执行。`;
+        case "blocked":
+            return `你没有权限调用敏感工具: ${toolLabel}\n如需执行，请由主人微信发起，或改成审批模式。`;
+        default:
+            return `敏感工具状态已更新: ${toolLabel}`;
+    }
+}
+
+function shouldSendWechatToolAuthNotice(config: ReturnType<typeof resolveWechatExtensionConfig>, params: {
+    state: WechatToolNoticeState;
+    chatType?: "group" | "direct";
+}): boolean {
+    if (params.chatType === "group" && !config.toolAuthNotifyInGroup) {
+        return false;
+    }
+    if (params.chatType !== "group" && !config.toolAuthNotifyInDirect) {
+        return false;
+    }
+    if (params.state === "blocked") {
+        return config.toolAuthNotifyBlocked;
+    }
+    if (params.state === "queued") {
+        return config.toolAuthNotifyApprovalQueued;
+    }
+    return config.toolAuthNotifyApprovalResolved;
+}
+
+async function sendWechatToolAuthNotice(api: OpenClawPluginApi, authContext: {
+    from?: string;
+    accountId?: string;
+    messageId?: string;
+}, text: string): Promise<void> {
+    const to = authContext.from?.trim();
+    if (!to || !text.trim()) {
+        return;
+    }
+    try {
+        const cfg = api.runtime.config.loadConfig();
+        await wechatPlugin.outbound?.sendText?.({
+            to,
+            text,
+            msg_id: authContext.messageId,
+            accountId: authContext.accountId || "default",
+            cfg,
+        } as any);
+    } catch (error: any) {
+        api.logger.warn?.(`[WeChat ToolAuth] Failed to send notice to ${to}: ${error?.message || String(error)}`);
+    }
+}
+
+function shouldApplyWechatToolAuth(params: {
+    sessionKey?: string;
+}): boolean {
+    return params.sessionKey?.includes(":wechat:") === true;
 }
 
 function closeWebSocketServer(server: WebSocketServer): Promise<void> {
@@ -399,7 +723,18 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         logBody.media = { ...logBody.media, data: `[base64 data, length: ${logBody.media.data.length}]` };
     }
     // api.logger.debug(`[WeChat] Inbound WS message: ${JSON.stringify(logBody)}`);
-    const { from, fromName, content, accountId, media, groupName, senderId, senderName, isGroup: isGroupPayload } = body;
+    const {
+        from,
+        fromName,
+        content,
+        accountId,
+        media,
+        groupName,
+        senderId,
+        senderName,
+        isGroup: isGroupPayload,
+        isMaster: isMasterPayload,
+    } = body;
 
     const runtime = api.runtime;
     const cfg = runtime.config.loadConfig();
@@ -461,12 +796,30 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
     })();
 
     const chatType = isGroup ? "group" : "direct";
+    const isMaster = isMasterPayload === true;
     // api.logger.debug(`[WeChat] Resolved message type: from=${from}, isGroup=${isGroup}, chatType=${chatType}`);
 
     const messageId = body?.messageId ? String(body.messageId) : `msg-${Date.now()}`;
     const resolvedSenderId = senderId || from;
     const resolvedSenderName = senderName || fromName || "User";
     const conversationLabel = isGroup ? (groupName || fromName || from) : resolvedSenderName;
+    const inboundTextPreview = summarizeWechatTextForLog(content);
+    const inboundMediaSummary = media
+        ? `media=${media.mime || media.type || "unknown"}:${media.name || media.path || "[inline]"}`
+        : "";
+    const conversationNameSummary = conversationLabel && conversationLabel !== from
+        ? ` conversation="${summarizeWechatTextForLog(conversationLabel, 80)}"`
+        : "";
+    const senderNameSummary = resolvedSenderName && resolvedSenderName !== resolvedSenderId
+        ? ` senderName="${summarizeWechatTextForLog(resolvedSenderName, 80)}"`
+        : "";
+    api.logger.info(
+        `[WeChat Inbound] from=${from} sender=${resolvedSenderId} chatType=${chatType} isMaster=${isMaster} msgId=${messageId}` +
+        `${conversationNameSummary}` +
+        `${senderNameSummary}` +
+        `${inboundTextPreview ? ` text="${inboundTextPreview}"` : ""}` +
+        `${inboundMediaSummary ? ` ${inboundMediaSummary}` : ""}`,
+    );
 
     const peer = {
         id: from,
@@ -486,11 +839,15 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
             id: `wechat:${resolvedSenderId}`,
             name: resolvedSenderName,
             isBot: false,
+            isMaster,
         },
         ConversationLabel: conversationLabel,
         GroupSubject: isGroup ? (groupName || fromName || from) : undefined,
         SenderName: resolvedSenderName,
         SenderId: resolvedSenderId,
+        OwnerAllowFrom: isMaster ? [resolvedSenderId] : undefined,
+        isMaster,
+        IsMaster: isMaster,
         MessageSid: messageId,
         MessageSidFull: messageId,
         From: from,
@@ -523,6 +880,20 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         },
     };
 
+    enqueueWechatInboundToolAuth({
+        sessionKey: ctx.SessionKey,
+        from,
+        accountId: accountId || "default",
+        chatType,
+        conversationLabel,
+        senderId: resolvedSenderId,
+        senderName: resolvedSenderName,
+        isMaster,
+        content: content || "",
+        messageId,
+        createdAt: Date.now(),
+    });
+
     const dispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
         onTyping: async () => { },
     } as any);
@@ -553,7 +924,13 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                         .filter(Boolean)
                         .join("\n\n");
                 }
-                const fullText = (typeof textValue === "string" ? textValue : JSON.stringify(textValue)).trim();
+                const rawFullText = typeof textValue === "string" ? textValue : JSON.stringify(textValue);
+                const fullText = collapseExactRepeatedReplyText(rawFullText);
+                if (fullText !== rawFullText.trim()) {
+                    api.logger.info(
+                        `[WeChat] Collapsed duplicated reply text from ${rawFullText.trim().length} chars to ${fullText.length} chars`,
+                    );
+                }
                 if (fullText.toUpperCase().includes("NO_REPLY")) {
                     api.logger.info(`[WeChat] Skipping reply due to NO_REPLY signal detected`);
                     return;
@@ -566,6 +943,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 if (cumulativeSentText && fullText.startsWith(cumulativeSentText)) {
                     newText = fullText.substring(cumulativeSentText.length);
                 }
+                newText = collapseExactRepeatedReplyText(newText);
 
                 const allMedia = [...(payload.mediaUrls || [])];
                 if (payload.mediaUrl && !allMedia.includes(payload.mediaUrl)) allMedia.push(payload.mediaUrl);
@@ -666,6 +1044,197 @@ const plugin = {
         try {
             api.logger.debug(`[WeChat] Registering plugin package... (PID: ${process.pid})`);
             setWechatRuntime(api.runtime);
+
+            api.on("before_dispatch", (event, ctx) => {
+                if (!shouldApplyWechatToolAuth({ sessionKey: ctx.sessionKey })) {
+                    return;
+                }
+
+                promoteWechatToolAuthForDispatch({
+                    sessionKey: ctx.sessionKey!,
+                    senderId: ctx.senderId || event.senderId,
+                    content: event.body || event.content,
+                });
+
+                return;
+            }, { priority: 100 });
+
+            api.on("before_agent_start", (_event, ctx) => {
+                if (!ctx.runId || !ctx.sessionKey) {
+                    return;
+                }
+                bindWechatToolAuthToRun({
+                    sessionKey: ctx.sessionKey,
+                    runId: ctx.runId,
+                });
+                return;
+            }, { priority: 100 });
+
+            api.on("before_tool_call", (event, ctx) => {
+                if (!ctx.runId) {
+                    return;
+                }
+
+                const cfg = api.runtime.config.loadConfig();
+                const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
+                const guardedTools = normalizeGuardedToolNameList(bridgeConfig.nonOwnerToolAuthTools);
+                const bypassWxids = normalizeWechatIdAllowList(bridgeConfig.toolAuthBypassWxids);
+                const toolName = event.toolName.trim().toLowerCase();
+                const toolSpecificBypassWxids = getWechatToolSpecificAllowList(bridgeConfig, toolName);
+                const authContext = getWechatToolAuthForRun(ctx.runId);
+
+                if (!guardedTools.has(toolName) || !authContext) {
+                    return;
+                }
+
+                const authSummary = summarizeWechatToolAuthRecord(authContext);
+                const generalBypassMatch = resolveWechatToolBypassMatch(bypassWxids, authContext);
+                const toolSpecificBypassMatch = resolveWechatToolBypassMatch(toolSpecificBypassWxids, authContext);
+                const bypassMatch = generalBypassMatch.matched ? generalBypassMatch : toolSpecificBypassMatch;
+                const bypassSource = generalBypassMatch.matched
+                    ? "whitelist-global"
+                    : (toolSpecificBypassMatch.matched ? `whitelist-tool:${toolName}` : undefined);
+                const isBypassWxid = bypassMatch.matched;
+
+                if (authContext.isMaster || isBypassWxid) {
+                    if (
+                        toolName === "exec" &&
+                        bridgeConfig.ownerExecBypassApproval &&
+                        event.params &&
+                        typeof event.params === "object"
+                    ) {
+                        api.logger.info(
+                            `[WeChat ToolAuth] Trusted bypass tool=${toolName} runId=${ctx.runId} source=${authContext.isMaster ? "master" : `${bypassSource || "whitelist"}:${bypassMatch.kind || "unknown"}`} ${authSummary}`,
+                        );
+                        return {
+                            params: {
+                                ...event.params,
+                                ask: "off",
+                            },
+                        };
+                    }
+                    if (isBypassWxid) {
+                        api.logger.info(
+                            `[WeChat ToolAuth] Whitelist bypass tool=${toolName} runId=${ctx.runId} source=${bypassSource || "whitelist"} matchedBy=${bypassMatch.kind || "unknown"} value=${bypassMatch.value || ""} ${authSummary}`,
+                        );
+                    }
+                    return;
+                }
+
+                if (bridgeConfig.nonOwnerToolAuthMode === "deny") {
+                    api.logger.warn(
+                        `[WeChat ToolAuth] Denied tool=${toolName} runId=${ctx.runId} ${authSummary}`,
+                    );
+                    if (shouldSendWechatToolAuthNotice(bridgeConfig, {
+                        state: "blocked",
+                        chatType: authContext.chatType,
+                    })) {
+                        void sendWechatToolAuthNotice(
+                            api,
+                            authContext,
+                            buildWechatToolNoticeText({
+                                toolName,
+                                state: "blocked",
+                                authContext,
+                                config: bridgeConfig,
+                            }),
+                        );
+                    }
+                    return {
+                        block: true,
+                        blockReason: `WeChat sender ${authContext.senderId || "unknown"} is not authorized to use ${toolName}.`,
+                    };
+                }
+
+                if (bridgeConfig.nonOwnerToolAuthMode === "approve") {
+                    api.logger.warn(
+                        `[WeChat ToolAuth] Approval required tool=${toolName} runId=${ctx.runId} ${authSummary}`,
+                    );
+                    if (shouldSendWechatToolAuthNotice(bridgeConfig, {
+                        state: "queued",
+                        chatType: authContext.chatType,
+                    })) {
+                        void sendWechatToolAuthNotice(
+                            api,
+                            authContext,
+                            buildWechatToolNoticeText({
+                                toolName,
+                                state: "queued",
+                                authContext,
+                                config: bridgeConfig,
+                            }),
+                        );
+                    }
+                    return {
+                        params:
+                            toolName === "exec"
+                                ? {
+                                    ...event.params,
+                                    ask: "off",
+                                }
+                                : event.params,
+                        requireApproval: {
+                            title: `Approve WeChat ${toolName}`,
+                            description: buildWechatToolApprovalDescription(toolName, authContext),
+                            severity: toolName === "exec" ? "critical" : "warning",
+                            timeoutMs: 120000,
+                            timeoutBehavior: "deny",
+                            onResolution: (decision) => {
+                                api.logger.info(
+                                    `[WeChat ToolAuth] Approval resolved tool=${toolName} runId=${ctx.runId} decision=${decision} ${authSummary}`,
+                                );
+                                const resolvedState: WechatToolNoticeState =
+                                    decision === "allow-once" ||
+                                    decision === "allow-always" ||
+                                    decision === "deny" ||
+                                    decision === "timeout" ||
+                                    decision === "cancelled"
+                                        ? decision
+                                        : "cancelled";
+                                if (shouldSendWechatToolAuthNotice(bridgeConfig, {
+                                    state: resolvedState,
+                                    chatType: authContext.chatType,
+                                })) {
+                                    void sendWechatToolAuthNotice(
+                                        api,
+                                        authContext,
+                                        buildWechatToolNoticeText({
+                                            toolName,
+                                            state: resolvedState,
+                                            authContext,
+                                            config: bridgeConfig,
+                                        }),
+                                    );
+                                }
+                            },
+                        },
+                    };
+                }
+
+                return;
+            }, { priority: 100 });
+
+            api.on("agent_end", (_event, ctx) => {
+                if (ctx.runId) {
+                    clearWechatToolAuthForRun(ctx.runId);
+                }
+            }, { priority: 100 });
+
+            api.on("subagent_spawned", (_event, ctx) => {
+                if (!ctx.childSessionKey || !ctx.requesterSessionKey) {
+                    return;
+                }
+                inheritWechatToolAuthForChildSession({
+                    requesterSessionKey: ctx.requesterSessionKey,
+                    childSessionKey: ctx.childSessionKey,
+                });
+            }, { priority: 100 });
+
+            api.on("session_end", (_event, ctx) => {
+                if (ctx.sessionKey) {
+                    clearWechatToolAuthForSession(ctx.sessionKey);
+                }
+            }, { priority: 100 });
 
             const sharedState = getGlobalState();
             sharedState.runtime = api.runtime;

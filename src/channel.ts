@@ -14,6 +14,20 @@ function buildOutboundFrame(event: "outbound_text" | "outbound_media", payload: 
     };
 }
 
+function summarizeWechatTextForLog(text: unknown, maxLength = 160): string {
+    if (typeof text !== "string") {
+        return "";
+    }
+    const normalized = text.replace(/\r\n/g, "\n").replace(/\n/g, "\\n").trim();
+    if (!normalized) {
+        return "";
+    }
+    if (normalized.length <= maxLength) {
+        return normalized;
+    }
+    return `${normalized.slice(0, maxLength)}...`;
+}
+
 export const wechatPlugin: ChannelPlugin<any> = {
     id: "wechat",
     meta: {
@@ -59,6 +73,80 @@ export const wechatPlugin: ChannelPlugin<any> = {
                     type: "array",
                     description: "Additional directories searched for relative media paths",
                     items: { type: "string" },
+                },
+                nonOwnerToolAuthMode: {
+                    type: "string",
+                    description: "How guarded tools behave for non-owner WeChat senders: off | deny | approve",
+                },
+                nonOwnerToolAuthTools: {
+                    type: "array",
+                    description: "Tool names guarded by WeChat owner auth, defaults to exec/process",
+                    items: { type: "string" },
+                },
+                toolAuthBypassWxids: {
+                    type: "array",
+                    description: "Trusted WeChat sender ids that bypass guarded tool deny/approval checks; supports sender wxid and direct-chat alias",
+                    items: { type: "string" },
+                },
+                toolAuthBypassByTool: {
+                    type: "object",
+                    description: "Per-tool trusted sender ids; keys are tool names like exec/process and values are arrays of wxids or direct-chat aliases",
+                    additionalProperties: {
+                        type: "array",
+                        items: { type: "string" },
+                    },
+                },
+                ownerExecBypassApproval: {
+                    type: "boolean",
+                    description: "Best-effort: force exec ask=off for owner WeChat senders before host exec policy runs",
+                },
+                toolAuthNotifyBlocked: {
+                    type: "boolean",
+                    description: "Whether to send a WeChat notice when a non-owner is directly blocked from guarded tools",
+                },
+                toolAuthNotifyApprovalQueued: {
+                    type: "boolean",
+                    description: "Whether to send a WeChat notice when guarded tool approval has been submitted",
+                },
+                toolAuthNotifyApprovalResolved: {
+                    type: "boolean",
+                    description: "Whether to send a WeChat notice when guarded tool approval resolves",
+                },
+                toolAuthNotifyInGroup: {
+                    type: "boolean",
+                    description: "Whether tool auth notices are allowed in group chats",
+                },
+                toolAuthNotifyInDirect: {
+                    type: "boolean",
+                    description: "Whether tool auth notices are allowed in direct chats",
+                },
+                toolAuthMessageBlocked: {
+                    type: "string",
+                    description: "Custom message template for direct block notices",
+                },
+                toolAuthMessageQueued: {
+                    type: "string",
+                    description: "Custom message template for approval queued notices",
+                },
+                toolAuthMessageAllowOnce: {
+                    type: "string",
+                    description: "Custom message template for allow-once approval notices",
+                },
+                toolAuthMessageAllowAlways: {
+                    type: "string",
+                    description: "Custom message template for allow-always approval notices",
+                },
+                toolAuthMessageDeny: {
+                    type: "string",
+                    description: "Custom message template for denied approval notices",
+                },
+                toolAuthMessageTimeout: {
+                    type: "string",
+                    description: "Custom message template for approval timeout notices",
+                },
+                toolAuthMessageCancelled: {
+                    type: "string",
+                    description: "Custom message template for cancelled approval notices",
                 },
             },
         },
@@ -110,6 +198,10 @@ export const wechatPlugin: ChannelPlugin<any> = {
     outbound: {
         deliveryMode: "direct",
         sendText: async ({ to, text, accountId }) => {
+            const runtime = getWechatRuntime();
+            runtime?.logger?.info?.(
+                `[WeChat Outbound] to=${to} account=${accountId || "default"} type=text text="${summarizeWechatTextForLog(text)}"`,
+            );
             const payload = {
                 type: "text",
                 to,
@@ -125,6 +217,10 @@ export const wechatPlugin: ChannelPlugin<any> = {
         },
         sendMedia: async ({ to, mediaUrl, text, accountId }) => {
             const runtime = getWechatRuntime();
+            runtime?.logger?.info?.(
+                `[WeChat Outbound] to=${to} account=${accountId || "default"} type=media media="${mediaUrl}"` +
+                `${text ? ` text="${summarizeWechatTextForLog(text)}"` : ""}`,
+            );
             const cfg = runtime.config.loadConfig();
             const bridgeConfig = resolveWechatExtensionConfig(cfg, (runtime as any).logger ?? console);
             const serveRoots = resolveWechatMediaServeRoots(cfg, (runtime as any).logger ?? console);
