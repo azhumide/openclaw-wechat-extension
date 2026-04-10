@@ -1,9 +1,11 @@
 import type { ChannelPlugin } from "openclaw/plugin-sdk";
 import { getWechatRuntime, isBridgeConnected, sendToBridge } from "./runtime.js";
 import { isPathWithinRoots, resolveWechatExtensionConfig, resolveWechatMediaServeRoots } from "./config.js";
+import { redactWechatWxids } from "./redaction.js";
 
 const CACHE_TTL = 60000;
 const contactNameCache: Map<string, { id: string; name: string; type: string; timestamp: number }> = new Map();
+const WECHAT_CHANNEL_MODE = "bridge-ws";
 
 function buildOutboundFrame(event: "outbound_text" | "outbound_media", payload: Record<string, unknown>) {
     return {
@@ -26,6 +28,30 @@ function summarizeWechatTextForLog(text: unknown, maxLength = 160): string {
         return normalized;
     }
     return `${normalized.slice(0, maxLength)}...`;
+}
+
+function redactWechatOutboundText(text: string, options: {
+    redactWxidsInOutboundText?: boolean;
+    redactExtraWxids?: string[];
+}): string {
+    return redactWechatWxids(text, {
+        enabled: options.redactWxidsInOutboundText !== false,
+        exactMatches: options.redactExtraWxids,
+    });
+}
+
+function summarizeWechatOutboundTextForLog(text: unknown, options: {
+    redactWxidsInLogs?: boolean;
+    redactExtraWxids?: string[];
+}): string {
+    return summarizeWechatTextForLog(
+        typeof text === "string"
+            ? redactWechatWxids(text, {
+                enabled: options.redactWxidsInLogs !== false,
+                exactMatches: options.redactExtraWxids,
+            })
+            : text,
+    );
 }
 
 export const wechatPlugin: ChannelPlugin<any> = {
@@ -74,6 +100,19 @@ export const wechatPlugin: ChannelPlugin<any> = {
                     description: "Additional directories searched for relative media paths",
                     items: { type: "string" },
                 },
+                redactWxidsInOutboundText: {
+                    type: "boolean",
+                    description: "Mask wxid_* identifiers in outbound reply text before sending to the bridge",
+                },
+                redactWxidsInLogs: {
+                    type: "boolean",
+                    description: "Mask wxid_* identifiers in WeChat plugin logs",
+                },
+                redactExtraWxids: {
+                    type: "array",
+                    description: "Additional exact-match WeChat ids to redact, for example custom ids like xdoufux",
+                    items: { type: "string" },
+                },
                 nonOwnerToolAuthMode: {
                     type: "string",
                     description: "How guarded tools behave for non-owner WeChat senders: off | deny | approve",
@@ -95,6 +134,10 @@ export const wechatPlugin: ChannelPlugin<any> = {
                         type: "array",
                         items: { type: "string" },
                     },
+                },
+                toolAuthAllowInstalledSkills: {
+                    type: "boolean",
+                    description: "Allow guarded exec/process calls that match installed skill command patterns, even for non-owner senders",
                 },
                 ownerExecBypassApproval: {
                     type: "boolean",
@@ -161,6 +204,21 @@ export const wechatPlugin: ChannelPlugin<any> = {
         },
     },
     status: {
+        buildChannelSummary: ({ snapshot }) => {
+            return {
+                configured: snapshot.configured ?? true,
+                running: snapshot.running ?? true,
+                connected: isBridgeConnected(),
+                mode: snapshot.mode ?? WECHAT_CHANNEL_MODE,
+                lastStartAt: snapshot.lastStartAt ?? null,
+                lastStopAt: snapshot.lastStopAt ?? null,
+                lastInboundAt: snapshot.lastInboundAt ?? null,
+                lastOutboundAt: snapshot.lastOutboundAt ?? null,
+                lastProbeAt: snapshot.lastProbeAt ?? null,
+                lastError: snapshot.lastError ?? null,
+                probe: snapshot.probe ?? null,
+            };
+        },
         buildAccountSnapshot: ({ account, runtime }) => {
             return {
                 ...runtime,
@@ -170,6 +228,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
                 configured: true,
                 running: true,
                 connected: isBridgeConnected(),
+                mode: WECHAT_CHANNEL_MODE,
             };
         },
     },
@@ -199,13 +258,16 @@ export const wechatPlugin: ChannelPlugin<any> = {
         deliveryMode: "direct",
         sendText: async ({ to, text, accountId }) => {
             const runtime = getWechatRuntime();
+            const cfg = runtime?.config.loadConfig?.() || {};
+            const bridgeConfig = resolveWechatExtensionConfig(cfg, (runtime as any)?.logger ?? console);
+            const safeText = redactWechatOutboundText(text, bridgeConfig);
             runtime?.logger?.info?.(
-                `[WeChat Outbound] to=${to} account=${accountId || "default"} type=text text="${summarizeWechatTextForLog(text)}"`,
+                `[WeChat Outbound] to=${to} account=${accountId || "default"} type=text text="${summarizeWechatOutboundTextForLog(safeText, bridgeConfig)}"`,
             );
             const payload = {
                 type: "text",
                 to,
-                text,
+                text: safeText,
                 accountId,
             };
             const sent = sendToBridge(buildOutboundFrame("outbound_text", payload));
@@ -217,12 +279,13 @@ export const wechatPlugin: ChannelPlugin<any> = {
         },
         sendMedia: async ({ to, mediaUrl, text, accountId }) => {
             const runtime = getWechatRuntime();
-            runtime?.logger?.info?.(
-                `[WeChat Outbound] to=${to} account=${accountId || "default"} type=media media="${mediaUrl}"` +
-                `${text ? ` text="${summarizeWechatTextForLog(text)}"` : ""}`,
-            );
             const cfg = runtime.config.loadConfig();
             const bridgeConfig = resolveWechatExtensionConfig(cfg, (runtime as any).logger ?? console);
+            const safeText = typeof text === "string" ? redactWechatOutboundText(text, bridgeConfig) : text;
+            runtime?.logger?.info?.(
+                `[WeChat Outbound] to=${to} account=${accountId || "default"} type=media media="${mediaUrl}"` +
+                `${safeText ? ` text="${summarizeWechatOutboundTextForLog(safeText, bridgeConfig)}"` : ""}`,
+            );
             const serveRoots = resolveWechatMediaServeRoots(cfg, (runtime as any).logger ?? console);
 
             // 局域网部署：如果是本地路径，转成 HTTP URL 让 aiBot 通过 HTTP 下载
@@ -256,6 +319,13 @@ export const wechatPlugin: ChannelPlugin<any> = {
                 const fs = await import("fs");
                 absolutePath = path.resolve(absolutePath);
 
+                if (!fs.existsSync(absolutePath)) {
+                    runtime?.logger?.warn?.(
+                        `[WeChat] Local media path missing before bridge conversion: raw="${mediaUrl}" resolved="${absolutePath}"`,
+                    );
+                    return;
+                }
+
                 if (fs.existsSync(absolutePath) && !isPathWithinRoots(absolutePath, serveRoots)) {
                     const stageBase = bridgeConfig.tmpDir
                         ? path.resolve(bridgeConfig.tmpDir)
@@ -287,7 +357,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
                 type: "media",
                 to,
                 mediaUrl: resolvedUrl,
-                text,
+                text: safeText,
                 accountId,
             };
 

@@ -44,6 +44,21 @@
   // ["/tmp/openclaw", "/data/shared_media"]
   "mediaSearchPaths": [],
 
+  // 是否在发给 OpenClawBridge 的文本中自动脱敏 wxid / 自定义微信号
+  // 推荐开启，避免模型回复里直接带出联系人标识
+  "redactWxidsInOutboundText": true,
+
+  // 是否在 WeChat 扩展自己的日志里自动脱敏 wxid / 自定义微信号
+  // 推荐开启，避免日志里泄露敏感 ID
+  "redactWxidsInLogs": true,
+
+  // 可选：额外需要“精确匹配脱敏”的自定义微信号
+  // 用于处理没有 wxid_ 前缀的账号，例如自定义号 / 别名型账号
+  // 只做精确匹配，不会模糊匹配普通英文单词
+  // 例子:
+  // ["xdoufux", "azhumide"]
+  "redactExtraWxids": [],
+
   // 非主人微信发送者调用敏感工具时的策略
   // 可选:
   // "off"     不额外拦截
@@ -72,6 +87,22 @@
   // }
   "toolAuthBypassByTool": {},
 
+  // 可选：skill 黑名单
+  // 命中这些 skillId 的普通用户会被拦截，主人和上面的 wxid 白名单不受影响
+  // 例子:
+  // ["gog", "spotify-player"]
+  "toolAuthBlockedSkills": [],
+
+  // 是否允许“已安装 skill”触发的敏感工具直接放行
+  // 目前会识别常见的 skill wrapper / skill 目录脚本调用
+  // 以及这些 skill exec 启动后对应的 process 会话
+  "toolAuthAllowInstalledSkills": false,
+
+  // 是否输出“已安装 skill 自动放行”调试日志
+  // 打开后，当某条 exec/process 没被识别成 skill 放行时
+  // 日志里会额外显示失败原因，方便排查
+  "toolAuthDebugInstalledSkills": false,
+
   // 主人调用 exec 时，是否在微信侧先把 ask 强制改成 off
   // 这是“尽量不弹审批”的最佳努力开关
   // 注意:
@@ -95,7 +126,7 @@
 
   // 可选：自定义工具权限提示文案模板
   // 可用占位符:
-  // {{toolName}} {{state}} {{stateLabel}} {{senderId}} {{senderName}}
+  // {{toolName}} {{state}} {{stateLabel}} {{senderId}} {{senderName}} {{skillId}}
   // {{from}} {{chatType}} {{chatTypeLabel}} {{conversationLabel}} {{question}}
   // 留空则使用内置默认文案
   "toolAuthMessageBlocked": "",

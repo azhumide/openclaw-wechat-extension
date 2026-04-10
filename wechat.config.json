@@ -7,14 +7,22 @@
   "workspaceBase": "/home/rs/.openclaw/workspace",
   "tmpDir": "/home/rs/.openclaw/workspace/downloads",
   "mediaSearchPaths": [],
+  "redactWxidsInOutboundText": true,
+  "redactWxidsInLogs": true,
+  "redactExtraWxids": [
+    "xdoufux"
+  ],
   "nonOwnerToolAuthMode": "deny",
-  "nonOwnerToolAuthTools": ["exec", "process"],
+  "nonOwnerToolAuthTools": ["exec", "process", "write", "message"],
   "toolAuthBypassWxids": [
     "wxid_9uwska6u4yzm22"
   ],
   "toolAuthBypassByTool": {
     "process": ["xdoufux"]
   },
+  "toolAuthBlockedSkills": ["gog", "gws-gmail", "didi-ride-skill", "kdocs", "gh-issues", "github", "626-rotator-skill", "gitlab-helper"],
+  "toolAuthAllowInstalledSkills": true,
+  "toolAuthDebugInstalledSkills": true,
   "ownerExecBypassApproval": true,
   "toolAuthNotifyBlocked": true,
   "toolAuthNotifyApprovalQueued": true,
