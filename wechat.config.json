@@ -13,14 +13,14 @@
     "xdoufux"
   ],
   "nonOwnerToolAuthMode": "deny",
-  "nonOwnerToolAuthTools": ["exec", "process", "write", "message"],
+  "nonOwnerToolAuthTools": ["exec", "process", "write"],
   "toolAuthBypassWxids": [
     "wxid_9uwska6u4yzm22"
   ],
   "toolAuthBypassByTool": {
     "process": ["xdoufux"]
   },
-  "toolAuthBlockedSkills": ["gog", "gws-gmail", "didi-ride-skill", "kdocs", "gh-issues", "github", "626-rotator-skill", "gitlab-helper"],
+  "toolAuthBlockedSkills": ["gog", "gws-gmail", "didi-ride-skill", "kdocs", "626-rotator-skill", "gitlab-helper"],
   "toolAuthAllowInstalledSkills": true,
   "toolAuthDebugInstalledSkills": true,
   "ownerExecBypassApproval": true,

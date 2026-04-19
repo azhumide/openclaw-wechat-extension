@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { Buffer } from "buffer";
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -45,6 +46,8 @@ const DUPLICATE_REGISTER_RECOVERY_COOLDOWN_MS = 5_000;
 const DUPLICATE_REGISTER_RECOVERY_LOG_INTERVAL_MS = 30_000;
 const WECHAT_TOOL_NOTICE_DEDUP_TTL_MS = 120_000;
 const WECHAT_TOOL_AUTH_LOG_DEDUP_TTL_MS = 120_000;
+const WECHAT_REPLY_MEDIA_DEDUP_TTL_MS = 15_000;
+const WECHAT_MEDIA_DEDUP_SAMPLE_BYTES = 128 * 1024;
 
 type WechatBridgeGlobalState = {
     runtime: OpenClawPluginApi["runtime"] | null;
@@ -64,6 +67,7 @@ type WechatBridgeGlobalState = {
     boundApis: Set<object>;
     recentToolNoticeAt: Map<string, number>;
     recentToolAuthLogAt: Map<string, number>;
+    recentReplyMediaAt: Map<string, number>;
 };
 
 function getGlobalState(): WechatBridgeGlobalState {
@@ -86,6 +90,7 @@ function getGlobalState(): WechatBridgeGlobalState {
     if (!(existing.boundApis instanceof Set)) existing.boundApis = new Set<object>();
     if (!(existing.recentToolNoticeAt instanceof Map)) existing.recentToolNoticeAt = new Map<string, number>();
     if (!(existing.recentToolAuthLogAt instanceof Map)) existing.recentToolAuthLogAt = new Map<string, number>();
+    if (!(existing.recentReplyMediaAt instanceof Map)) existing.recentReplyMediaAt = new Map<string, number>();
     return existing as WechatBridgeGlobalState;
 }
 
@@ -164,6 +169,55 @@ function restoreServedFilePath(rawPath: string): string {
 
 function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 智能合并两个可能重叠的字符串。常用于处理 LLM 重复输出前缀的情况。
+ */
+function mergeOverlappingStrings(current: string, next: string): string {
+    if (!next) return current;
+    if (!current) return next;
+    
+    // 1. 完全包含检查
+    if (next.startsWith(current)) return next;
+    if (current.includes(next)) return current;
+
+    // 清理空白字符以进行模糊匹配（防止模型输出过程中更改了 \n 为 \n\n 导致重叠算法失效）
+    const normC = current.replace(/\s+/g, '');
+    const normN = next.replace(/\s+/g, '');
+
+    // 2. 模糊累计检查 (如果 next 实际上只是 current 的累积拓展)
+    if (normN.startsWith(normC)) {
+        return next;
+    }
+    
+    // 3. 模糊结尾/开头重叠检查
+    const maxPossibleOverlap = Math.min(normC.length, normN.length);
+    const minOverlap = Math.min(maxPossibleOverlap, 4); 
+    
+    for (let len = maxPossibleOverlap; len >= minOverlap; len--) {
+        const prefixNormN = normN.slice(0, len);
+        if (normC.endsWith(prefixNormN)) {
+            // 找到了无视空白的重叠！
+            // 现在我们要截取 next 中不需要的部分。我们需要跳过 len 个非空白字符
+            let charsToSkip = len;
+            let cutIndex = 0;
+            while (charsToSkip > 0 && cutIndex < next.length) {
+                if (!/\s/.test(next[cutIndex])) {
+                    charsToSkip--;
+                }
+                cutIndex++;
+            }
+            
+            // 将 current 加上 next 去掉重叠部分的内容
+            const separator = (current.endsWith('\n') || next.slice(cutIndex).startsWith('\n')) ? "" : " ";
+            return current + separator + next.slice(cutIndex).trimStart();
+        }
+    }
+    
+    // 4. 无重叠，正常相加
+    const separator = (current.endsWith('\n') || next.startsWith('\n')) ? "" : "\n";
+    return current + separator + next;
 }
 
 type WechatReplyCollapseResult = {
@@ -438,6 +492,60 @@ function isWechatSafeLocalAttachmentPath(filePath: string): boolean {
     return WECHAT_SAFE_LOCAL_ATTACHMENT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
 }
 
+type WechatMediaCandidate = {
+    mediaUrl: string;
+    dedupKey: string;
+};
+
+function buildWechatLocalMediaDedupKey(filePath: string, logger?: OpenClawPluginApi["logger"]): string {
+    const absolutePath = path.resolve(filePath.trim());
+
+    try {
+        const stat = fs.statSync(absolutePath);
+        const hash = createHash("sha1");
+        hash.update(`size:${stat.size};`);
+
+        const fd = fs.openSync(absolutePath, "r");
+        try {
+            const sampleBytes = Math.min(Number(stat.size), WECHAT_MEDIA_DEDUP_SAMPLE_BYTES);
+            if (sampleBytes > 0) {
+                const headBuffer = Buffer.alloc(sampleBytes);
+                const headRead = fs.readSync(fd, headBuffer, 0, sampleBytes, 0);
+                hash.update(headBuffer.subarray(0, headRead));
+
+                if (stat.size > sampleBytes) {
+                    const tailBytes = Math.min(Number(stat.size) - sampleBytes, WECHAT_MEDIA_DEDUP_SAMPLE_BYTES);
+                    if (tailBytes > 0) {
+                        const tailBuffer = Buffer.alloc(tailBytes);
+                        const tailRead = fs.readSync(fd, tailBuffer, 0, tailBytes, Number(stat.size) - tailBytes);
+                        hash.update(tailBuffer.subarray(0, tailRead));
+                    }
+                }
+            }
+        } finally {
+            fs.closeSync(fd);
+        }
+
+        return `local:${path.extname(absolutePath).toLowerCase()}:${hash.digest("hex")}`;
+    } catch (err: any) {
+        logger?.warning?.(
+            `[WeChat] Failed to fingerprint local media for dedup; fallback to path key raw=${filePath} resolved=${absolutePath} err=${err?.message || err}`,
+        );
+        return `local-path:${absolutePath}`;
+    }
+}
+
+function buildWechatMediaDedupKey(params: {
+    mediaUrl: string;
+    logger?: OpenClawPluginApi["logger"];
+}): string {
+    const trimmed = params.mediaUrl.trim();
+    if (!isWechatLocalMediaReference(trimmed)) {
+        return `remote:${trimmed}`;
+    }
+    return buildWechatLocalMediaDedupKey(trimmed, params.logger);
+}
+
 function shouldBlockWechatLocalAttachmentDelivery(params: {
     mediaUrl: string;
     authContext: {
@@ -482,8 +590,10 @@ function shouldBlockWechatLocalAttachmentDelivery(params: {
 function filterWechatExistingMediaCandidates(params: {
     mediaUrls: string[];
     logger?: OpenClawPluginApi["logger"];
-}): string[] {
-    const filtered: string[] = [];
+    resolveDedupKey?: (mediaUrl: string) => string;
+}): WechatMediaCandidate[] {
+    const filtered: WechatMediaCandidate[] = [];
+    const seenDedupKeys = new Set<string>();
 
     for (const mediaUrl of params.mediaUrls) {
         const trimmed = mediaUrl.trim();
@@ -491,7 +601,14 @@ function filterWechatExistingMediaCandidates(params: {
             continue;
         }
         if (!isWechatLocalMediaReference(trimmed)) {
-            filtered.push(trimmed);
+            const dedupKey = params.resolveDedupKey
+                ? params.resolveDedupKey(trimmed)
+                : buildWechatMediaDedupKey({ mediaUrl: trimmed, logger: params.logger });
+            if (seenDedupKeys.has(dedupKey)) {
+                continue;
+            }
+            seenDedupKeys.add(dedupKey);
+            filtered.push({ mediaUrl: trimmed, dedupKey });
             continue;
         }
         const absolutePath = path.resolve(trimmed);
@@ -501,7 +618,17 @@ function filterWechatExistingMediaCandidates(params: {
             );
             continue;
         }
-        filtered.push(trimmed);
+        const dedupKey = params.resolveDedupKey
+            ? params.resolveDedupKey(trimmed)
+            : buildWechatMediaDedupKey({ mediaUrl: trimmed, logger: params.logger });
+        if (seenDedupKeys.has(dedupKey)) {
+            params.logger?.info?.(
+                `[WeChat] Deduped equivalent local media candidate before outbound send: raw=${trimmed} key=${dedupKey}`,
+            );
+            continue;
+        }
+        seenDedupKeys.add(dedupKey);
+        filtered.push({ mediaUrl: trimmed, dedupKey });
     }
 
     return filtered;
@@ -2043,6 +2170,50 @@ function claimWechatToolAuthLogDedup(params: {
     return true;
 }
 
+function pruneWechatReplyMediaDedupMap(now = Date.now()) {
+    const dedupMap = getGlobalState().recentReplyMediaAt;
+    for (const [key, timestamp] of dedupMap) {
+        if (now - timestamp > WECHAT_REPLY_MEDIA_DEDUP_TTL_MS) {
+            dedupMap.delete(key);
+        }
+    }
+}
+
+function buildWechatReplyMediaDedupKey(params: {
+    sessionKey: string;
+    dispatchId?: string;
+    mediaDedupKey: string;
+}): string {
+    return [
+        params.sessionKey.trim(),
+        params.dispatchId?.trim() || "no-dispatch-id",
+        params.mediaDedupKey.trim(),
+    ].join("|");
+}
+
+function hasRecentWechatReplyMedia(dedupKey: string): boolean {
+    const now = Date.now();
+    pruneWechatReplyMediaDedupMap(now);
+    const seenAt = getGlobalState().recentReplyMediaAt.get(dedupKey);
+    return typeof seenAt === "number" && now - seenAt <= WECHAT_REPLY_MEDIA_DEDUP_TTL_MS;
+}
+
+function claimWechatReplyMediaDedup(dedupKey: string): boolean {
+    const now = Date.now();
+    pruneWechatReplyMediaDedupMap(now);
+    const dedupMap = getGlobalState().recentReplyMediaAt;
+    const seenAt = dedupMap.get(dedupKey);
+    if (typeof seenAt === "number" && now - seenAt <= WECHAT_REPLY_MEDIA_DEDUP_TTL_MS) {
+        return false;
+    }
+    dedupMap.set(dedupKey, now);
+    return true;
+}
+
+function releaseWechatReplyMediaDedup(dedupKey: string) {
+    getGlobalState().recentReplyMediaAt.delete(dedupKey);
+}
+
 async function sendWechatToolAuthNotice(api: OpenClawPluginApi, authContext: {
     from?: string;
     accountId?: string;
@@ -2822,6 +2993,14 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
     // api.logger.debug(`[WeChat] Resolved message type: from=${from}, isGroup=${isGroup}, chatType=${chatType}`);
 
     const messageId = body?.messageId ? String(body.messageId) : `msg-${Date.now()}`;
+    const upstreamMessageTraceId = [
+        body?.original_msg_id,
+        body?.msg_id,
+        body?.originalMsgId,
+        body?.msgId,
+    ]
+        .map((value) => value == null ? "" : String(value).trim())
+        .find(Boolean);
     const resolvedSenderId = senderId || from;
     const resolvedSenderName = senderName || fromName || "User";
     const conversationLabel = isGroup ? (groupName || fromName || from) : resolvedSenderName;
@@ -2877,6 +3056,9 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         isMaster,
         IsMaster: isMaster,
         messageId,
+        originalMsgId: upstreamMessageTraceId,
+        OriginalMsgId: upstreamMessageTraceId,
+        original_msg_id: upstreamMessageTraceId,
         MessageSid: messageId,
         MessageSidFull: messageId,
         from,
@@ -2987,18 +3169,137 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         return;
     }
 
-    const dispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
+    let cumulativeSentText = "";
+    let turnTextSeen = "";
+    const sentMediaKeys = new Set<string>();
+    let pendingBlockMediaPaths: WechatMediaCandidate[] = [];
+    let pendingBlockMediaTimer: ReturnType<typeof setTimeout> | null = null;
+    const pendingBlockMediaDelayMs = 1200;
+    const mediaDedupKeyCache = new Map<string, string>();
+    const replyMediaDispatchId = upstreamMessageTraceId || messageId;
+
+    const resolveMediaDedupKey = (mediaUrl: string) => {
+        const trimmed = mediaUrl.trim();
+        const cacheKey = isWechatLocalMediaReference(trimmed)
+            ? `local:${path.resolve(trimmed)}`
+            : `remote:${trimmed}`;
+        const cached = mediaDedupKeyCache.get(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const dedupKey = buildWechatMediaDedupKey({
+            mediaUrl: trimmed,
+            logger: api.logger,
+        });
+        mediaDedupKeyCache.set(cacheKey, dedupKey);
+        return dedupKey;
+    };
+
+    const buildReplyMediaScopeKey = (mediaDedupKey: string) =>
+        buildWechatReplyMediaDedupKey({
+            sessionKey,
+            dispatchId: replyMediaDispatchId,
+            mediaDedupKey,
+        });
+
+    const isRecentlySentReplyMedia = (mediaDedupKey: string) =>
+        hasRecentWechatReplyMedia(buildReplyMediaScopeKey(mediaDedupKey));
+
+    const sendReplyMediaCandidate = async (
+        mediaCandidate: WechatMediaCandidate,
+        source: "buffered-block" | "inline-directive" | "payload-media",
+    ) => {
+        if (!wechatPlugin.outbound?.sendMedia) {
+            return false;
+        }
+        if (sentMediaKeys.has(mediaCandidate.dedupKey)) {
+            return false;
+        }
+
+        const replyMediaScopeKey = buildReplyMediaScopeKey(mediaCandidate.dedupKey);
+        if (!claimWechatReplyMediaDedup(replyMediaScopeKey)) {
+            api.logger.info(
+                `[WeChat] Skipping recent duplicate reply media session=${sessionKey} trace=${replyMediaDispatchId} ` +
+                `source=${source} media="${summarizeWechatTextForLog(mediaCandidate.mediaUrl, 180)}"`,
+            );
+            return false;
+        }
+
+        sentMediaKeys.add(mediaCandidate.dedupKey);
+        try {
+            const sendResult = await wechatPlugin.outbound.sendMedia({
+                to: from,
+                mediaUrl: mediaCandidate.mediaUrl,
+                text: "",
+                msg_id: messageId,
+                original_msg_id: upstreamMessageTraceId,
+                accountId: accountId || "default",
+                cfg,
+            } as any);
+            if (sendResult?.ok === false) {
+                sentMediaKeys.delete(mediaCandidate.dedupKey);
+                releaseWechatReplyMediaDedup(replyMediaScopeKey);
+                return false;
+            }
+            return true;
+        } catch (err) {
+            sentMediaKeys.delete(mediaCandidate.dedupKey);
+            releaseWechatReplyMediaDedup(replyMediaScopeKey);
+            throw err;
+        }
+    };
+
+    const clearPendingBlockMediaTimer = () => {
+        if (pendingBlockMediaTimer) {
+            clearTimeout(pendingBlockMediaTimer);
+            pendingBlockMediaTimer = null;
+        }
+    };
+
+    const takePendingBlockMediaPaths = () => {
+        const uniquePending = pendingBlockMediaPaths.filter((candidate, index, list) =>
+            !!candidate?.mediaUrl &&
+            list.findIndex((item) => item.dedupKey === candidate.dedupKey) === index &&
+            !sentMediaKeys.has(candidate.dedupKey) &&
+            !isRecentlySentReplyMedia(candidate.dedupKey),
+        );
+        pendingBlockMediaPaths = [];
+        return uniquePending;
+    };
+
+    const flushPendingBlockMediaPaths = async (reason: string) => {
+        clearPendingBlockMediaTimer();
+        const pendingMediaToSend = takePendingBlockMediaPaths();
+        if (!pendingMediaToSend.length) {
+            return;
+        }
+
+        api.logger.info(
+            `[WeChat] Flushing buffered media-only block reason=${reason} count=${pendingMediaToSend.length}`,
+        );
+
+        for (const mediaCandidate of pendingMediaToSend) {
+            await sendReplyMediaCandidate(mediaCandidate, "buffered-block");
+        }
+    };
+
+    const schedulePendingBlockMediaFlush = () => {
+        clearPendingBlockMediaTimer();
+        pendingBlockMediaTimer = setTimeout(() => {
+            void flushPendingBlockMediaPaths("timeout");
+        }, pendingBlockMediaDelayMs);
+    };
+
+    const baseDispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
         onTyping: async () => { },
     } as any);
 
-    let cumulativeSentText = "";
-    const sentMediaPaths = new Set<string>();
-
-    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    const dispatchResult = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx,
         cfg,
         dispatcherOptions: {
-            ...dispatcher,
+            ...baseDispatcher,
             deliver: async (...args: any[]) => {
                 const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
                 const replyAuthContext = {
@@ -3034,18 +3335,37 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 const payload = (typeof args[0] === 'object' && args[0] !== null) ? args[0] : {};
                 const info = (args.length > 1 && typeof args[1] === 'object') ? args[1] : {};
                 
-                const rawPayloadStr = JSON.stringify(redactWechatPayloadForLogs(payload, bridgeConfig));
-                const textFromArg0 = (typeof args[0] === 'string' ? args[0] : "");
-                api.logger.info(`[WeChat Debug] Resolved Payload: ${rawPayloadStr}, kind: ${info.kind || 'unknown'}, textArg0Len: ${textFromArg0.length}`);
+                const payloadKeys = Object.keys(payload);
+                const payloadPreviews = payloadKeys.map(k => {
+                    const val = payload[k];
+                    const str = typeof val === 'string' ? val : JSON.stringify(val);
+                    return `${k}=(${(str || '').substring(0, 40)}${(str || '').length > 40 ? '...' : ''})`;
+                });
 
-                let textValue = textFromArg0 || payload.text || payload.message || payload.content || payload.answer || "";
-                if (!textValue && Array.isArray(payload.blocks)) {
-                    textValue = payload.blocks
+                const textFromArg0 = (typeof args[0] === 'string' ? args[0] : "");
+                
+                // Track all text seen in this specific turn across all dispatcher calls
+                // Read-only here, updates belong to onPartialReply
+                let currentIncomingText = textFromArg0 || payload.text || payload.message || payload.content || payload.answer || payload.stdout || payload.result || payload.output || payload.data || "";
+                
+                if (!currentIncomingText && Array.isArray(payload.blocks)) {
+                    currentIncomingText = payload.blocks
                         .map((b: any) => (typeof b === "string" ? b : (b.text || b.content || "")))
                         .filter(Boolean)
                         .join("\n\n");
                 }
-                const rawFullText = typeof textValue === "string" ? textValue : JSON.stringify(textValue);
+                
+                if (currentIncomingText) {
+                    turnTextSeen = mergeOverlappingStrings(turnTextSeen, currentIncomingText);
+                }
+
+                api.logger.info(
+                    `[WeChat Debug] Kind=${info.kind || 'unknown'}, ` +
+                    `SeenLen=${turnTextSeen.length}, ` +
+                    `Payload: ${payloadPreviews.join(" | ")}`
+                );
+
+                const rawFullText = turnTextSeen;
                 const fullTextResult = collapseRepeatedReplyText(rawFullText);
                 const fullText = fullTextResult.text;
                 if (fullTextResult.mode !== "none") {
@@ -3085,7 +3405,14 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 let newText = fullText;
                 if (cumulativeSentText && fullText.startsWith(cumulativeSentText)) {
                     newText = fullText.substring(cumulativeSentText.length);
+                } else if (cumulativeSentText && !fullText.startsWith(cumulativeSentText)) {
+                    // Safety fallback: if they drifted, try to find current end
+                    const lastSentIndex = fullText.lastIndexOf(cumulativeSentText);
+                    if (lastSentIndex !== -1) {
+                         newText = fullText.substring(lastSentIndex + cumulativeSentText.length);
+                    }
                 }
+
                 const newTextResult = collapseRepeatedReplyText(newText);
                 newText = newTextResult.text;
                 if (newTextResult.mode !== "none") {
@@ -3121,23 +3448,31 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                     workspaceBase: bridgeConfig.workspaceBase,
                 });
                 let textToProcess = extractedBareMedia.text;
+                
+                // [Crucial Check] If we already sent this exact line, skip it
+                if (textToProcess.trim() && cumulativeSentText.includes(textToProcess.trim())) {
+                    api.logger.info(`[WeChat] Skipping redundant block text: "${textToProcess.trim().substring(0, 20)}..."`);
+                    textToProcess = ""; 
+                }
+
                 const rawMedia = [...(payload.mediaUrls || []), ...extractedBareMedia.mediaPaths];
                 if (payload.mediaUrl && !rawMedia.includes(payload.mediaUrl)) rawMedia.push(payload.mediaUrl);
                 const existingMedia = filterWechatExistingMediaCandidates({
                     mediaUrls: rawMedia,
                     logger: api.logger,
+                    resolveDedupKey: resolveMediaDedupKey,
                 });
-                const allMedia: string[] = [];
+                const allMedia: WechatMediaCandidate[] = [];
                 for (const mediaCandidate of existingMedia) {
                     const deliveryDecision = shouldBlockWechatLocalAttachmentDelivery({
-                        mediaUrl: mediaCandidate,
+                        mediaUrl: mediaCandidate.mediaUrl,
                         authContext: replyAuthContext,
                         config: bridgeConfig,
                     });
                     if (deliveryDecision.blocked) {
                         api.logger.warn(
                             `[WeChat ToolAuth] Blocking outbound local attachment delivery to ${from} (${chatType}) ` +
-                            `sender=${resolvedSenderId} path="${summarizeWechatTextForLog(deliveryDecision.absolutePath || mediaCandidate, 180)}" ` +
+                            `sender=${resolvedSenderId} path="${summarizeWechatTextForLog(deliveryDecision.absolutePath || mediaCandidate.mediaUrl, 180)}" ` +
                             `reason=${deliveryDecision.reason || "unknown"}`,
                         );
                         await notifyBlockedLocalAttachment();
@@ -3153,13 +3488,51 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                     }
                 }
                 
-                const hasNewMedia = allMedia.some(m => !sentMediaPaths.has(m));
+                const hasNewMedia = allMedia.some(
+                    (candidate) =>
+                        !sentMediaKeys.has(candidate.dedupKey) &&
+                        !isRecentlySentReplyMedia(candidate.dedupKey),
+                );
+                const isMediaOnlyBlock = info.kind === "block" && !textToProcess && hasNewMedia;
+                if (isMediaOnlyBlock) {
+                    const unsentMedia = allMedia.filter(
+                        (candidate, index, list) =>
+                            !sentMediaKeys.has(candidate.dedupKey) &&
+                            !isRecentlySentReplyMedia(candidate.dedupKey) &&
+                            list.findIndex((item) => item.dedupKey === candidate.dedupKey) === index &&
+                            !pendingBlockMediaPaths.some((item) => item.dedupKey === candidate.dedupKey),
+                    );
+                    if (unsentMedia.length) {
+                        pendingBlockMediaPaths.push(...unsentMedia);
+                        schedulePendingBlockMediaFlush();
+                        api.logger.info(
+                            `[WeChat] Buffered media-only block count=${unsentMedia.length} waitMs=${pendingBlockMediaDelayMs}`,
+                        );
+                        return;
+                    }
+                }
+
+                if (textToProcess && pendingBlockMediaPaths.length) {
+                    const pendingMediaToMerge = takePendingBlockMediaPaths();
+                    if (pendingMediaToMerge.length) {
+                        api.logger.info(
+                            `[WeChat] Merging buffered media-only block into text reply count=${pendingMediaToMerge.length} kind=${info.kind || "unknown"}`,
+                        );
+                        for (const pendingMedia of pendingMediaToMerge) {
+                            if (!allMedia.some((item) => item.dedupKey === pendingMedia.dedupKey)) {
+                                allMedia.push(pendingMedia);
+                            }
+                        }
+                    }
+                }
                 
-                // Regex-based media parsing also contributes to sentMediaPaths
+                // Regex-based media parsing also contributes to sentMediaKeys
                 // We'll process the full text if it's the first time, 
                 // or just the newText if it's incremental.
-                if (!textToProcess && !hasNewMedia && info.kind === "final") {
-                    api.logger.info(`[WeChat] Skipping redundant final reply (already sent in blocks)`);
+                if (!textToProcess && !hasNewMedia) {
+                    api.logger.info(
+                        `[WeChat] Skipping redundant ${info.kind} reply (no new text/media)`,
+                    );
                     return;
                 }
 
@@ -3177,12 +3550,18 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                             to: from,
                             text: precedingText,
                             msg_id: messageId,
+                            original_msg_id: upstreamMessageTraceId,
                             accountId: accountId || "default",
                             cfg,
                         } as any);
                     }
                     const mPath = match[1];
-                    if (mPath && !sentMediaPaths.has(mPath)) {
+                    const mPathDedupKey = mPath ? resolveMediaDedupKey(mPath) : "";
+                    if (
+                        mPath &&
+                        !sentMediaKeys.has(mPathDedupKey) &&
+                        !isRecentlySentReplyMedia(mPathDedupKey)
+                    ) {
                         const deliveryDecision = shouldBlockWechatLocalAttachmentDelivery({
                             mediaUrl: mPath,
                             authContext: replyAuthContext,
@@ -3198,18 +3577,13 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                             cursor = match.index + match[0].length;
                             continue;
                         }
-                        sentMediaPaths.add(mPath);
-
-                        if (wechatPlugin.outbound?.sendMedia) {
-                            await wechatPlugin.outbound.sendMedia({
-                                to: from,
+                        await sendReplyMediaCandidate(
+                            {
                                 mediaUrl: mPath,
-                                text: "",
-                                msg_id: messageId,
-                                accountId: accountId || "default",
-                                cfg,
-                            } as any);
-                        }
+                                dedupKey: mPathDedupKey,
+                            },
+                            "inline-directive",
+                        );
                     }
                     cursor = match.index + match[0].length;
                 }
@@ -3220,36 +3594,80 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                         to: from,
                         text: remainingText,
                         msg_id: messageId,
+                        original_msg_id: upstreamMessageTraceId,
                         accountId: accountId || "default",
                         cfg,
                     } as any);
                 }
 
                 // Process explicit media urls from payload
-                for (const mUrl of allMedia) {
-                    if (!sentMediaPaths.has(mUrl)) {
-                        sentMediaPaths.add(mUrl);
-                        if (wechatPlugin.outbound?.sendMedia) {
-                            await wechatPlugin.outbound.sendMedia({
-                                to: from,
-                                mediaUrl: mUrl,
-                                text: "",
-                                msg_id: messageId,
-                                accountId: accountId || "default",
-                                cfg,
-                            } as any);
-                        }
+                for (const mediaCandidate of allMedia) {
+                    if (
+                        !sentMediaKeys.has(mediaCandidate.dedupKey) &&
+                        !isRecentlySentReplyMedia(mediaCandidate.dedupKey)
+                    ) {
+                        await sendReplyMediaCandidate(mediaCandidate, "payload-media");
                     }
                 }
 
-                // Update turn state
+                // Update turn state - ONLY text, NO placeholders
                 if (textToProcess) {
-                    cumulativeSentText += textToProcess;
+                    const textOnly = textToProcess.replace(/(?:MEDIA|FILE):([^\s]+)/g, "").trim();
+                    if (textOnly) {
+                        cumulativeSentText += (cumulativeSentText ? (textOnly.startsWith("\n") ? "" : "\n") : "") + textOnly;
+                    }
                 }
 
             },
         },
+        replyOptions: {
+            onPartialReply: (payload) => {
+                const txt = payload.text || payload.content || payload.message || payload.answer || "";
+                if (txt && typeof txt === 'string') {
+                    // 使用智能重叠合并，防止 AI 重复输出前缀导致的翻倍
+                    turnTextSeen = mergeOverlappingStrings(turnTextSeen, txt);
+                }
+            }
+        }
     });
+
+    // [Fallback] Flush any remaining buffered media that was never merged into a text reply
+    if (pendingBlockMediaPaths.length) {
+        await flushPendingBlockMediaPaths("post-dispatch-settle");
+    }
+
+    // [Fallback] If deliver was never called (or never sent text), but onPartialReply
+    // captured text content, send it now as a final fallback.
+    // This handles the scenario where OpenClaw core dispatches media via direct
+    // sendMedia calls (e.g. during tool execution) but does not route the final
+    // text reply through the deliver callback.
+    const unseenText = turnTextSeen.trim();
+    if (!cumulativeSentText && unseenText && wechatPlugin.outbound?.sendText) {
+        const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
+        const internalCheck = isWechatInternalStatusReply(unseenText);
+        const hasNoReply = unseenText.toUpperCase().includes("NO_REPLY");
+        if (!internalCheck.matched && !hasNoReply) {
+            api.logger.info(
+                `[WeChat] Fallback: deliver never sent text but onPartialReply captured content, sending now ` +
+                `session=${sessionKey} textLen=${unseenText.length} text="${summarizeWechatTextForLog(unseenText, 120)}"`,
+            );
+            await wechatPlugin.outbound.sendText({
+                to: from,
+                text: unseenText,
+                msg_id: messageId,
+                original_msg_id: upstreamMessageTraceId,
+                accountId: accountId || "default",
+                cfg,
+            } as any);
+            cumulativeSentText = unseenText;
+        }
+    }
+
+    api.logger.info(
+        `[WeChat Debug] Dispatch settled session=${sessionKey} trace=${replyMediaDispatchId} queuedFinal=${dispatchResult?.queuedFinal ? "true" : "false"} ` +
+        `counts=${JSON.stringify(dispatchResult?.counts || {})} cumulativeTextLen=${cumulativeSentText.length} ` +
+        `sentMedia=${sentMediaKeys.size} pendingMedia=${pendingBlockMediaPaths.length}`,
+    );
 }
 
 
@@ -3339,6 +3757,57 @@ const plugin = {
             }
             const sharedState = getGlobalState();
 
+            const tryBindWechatToolAuthForRun = (params: {
+                ctx: Record<string, unknown> | undefined;
+                hookName: string;
+                runId?: string;
+            }) => {
+                const sessionKey = resolveWechatContextSessionKey(params.ctx);
+                const runId = params.runId?.trim() ||
+                    (typeof params.ctx?.runId === "string" && params.ctx.runId.trim() ? params.ctx.runId.trim() : "");
+                if (!runId || !sessionKey) {
+                    return;
+                }
+
+                const existingRunAuth = getWechatToolAuthForRun(runId);
+                if (existingRunAuth) {
+                    return existingRunAuth;
+                }
+
+                const boundAuth = bindWechatToolAuthToRun({
+                    sessionKey,
+                    runId,
+                });
+                if (boundAuth) {
+                    api.logger.debug?.(
+                        `[WeChat ToolAuth] Bound auth to run via ${params.hookName} ${summarizeWechatToolAuthDebugState({
+                            sessionKey,
+                            runId,
+                        })}`,
+                    );
+                    return boundAuth;
+                }
+
+                if (shouldApplyWechatToolAuth({ sessionKey, runId })) {
+                    const existingSessionAuth = getWechatToolAuthForSession(sessionKey);
+                    const debugState = summarizeWechatToolAuthDebugState({
+                        sessionKey,
+                        runId,
+                    });
+                    if (existingSessionAuth) {
+                        api.logger.debug?.(
+                            `[WeChat ToolAuth] Bind to run skipped via ${params.hookName} because auth context is already available source=session ${debugState}`,
+                        );
+                    } else {
+                        api.logger.debug?.(
+                            `[WeChat ToolAuth] Failed to bind auth to run via ${params.hookName} ${debugState}`,
+                        );
+                    }
+                }
+
+                return;
+            };
+
             api.on("before_dispatch", (event, ctx) => {
                 const sessionKey = resolveWechatContextSessionKey(ctx as Record<string, unknown>);
                 if (!shouldApplyWechatToolAuth({ sessionKey })) {
@@ -3362,34 +3831,28 @@ const plugin = {
                 return;
             }, { priority: 100 });
 
+            api.on("before_model_resolve", (_event, ctx) => {
+                tryBindWechatToolAuthForRun({
+                    ctx: ctx as Record<string, unknown>,
+                    hookName: "before_model_resolve",
+                });
+                return;
+            }, { priority: 100 });
+
+            api.on("before_prompt_build", (_event, ctx) => {
+                tryBindWechatToolAuthForRun({
+                    ctx: ctx as Record<string, unknown>,
+                    hookName: "before_prompt_build",
+                });
+                return;
+            }, { priority: 100 });
+
             api.on("before_agent_start", (_event, ctx) => {
-                const sessionKey = resolveWechatContextSessionKey(ctx as Record<string, unknown>);
-                if (!ctx.runId || !sessionKey) {
-                    return;
-                }
-                const boundAuth = bindWechatToolAuthToRun({
-                    sessionKey,
+                tryBindWechatToolAuthForRun({
+                    ctx: ctx as Record<string, unknown>,
+                    hookName: "before_agent_start",
                     runId: ctx.runId,
                 });
-                if (shouldApplyWechatToolAuth({ sessionKey }) && !boundAuth) {
-                    const existingRunAuth = getWechatToolAuthForRun(ctx.runId);
-                    const existingSessionAuth = getWechatToolAuthForSession(sessionKey);
-                    const debugState = summarizeWechatToolAuthDebugState({
-                        sessionKey,
-                        runId: ctx.runId,
-                    });
-                    if (existingRunAuth || existingSessionAuth) {
-                        api.logger.debug?.(
-                            `[WeChat ToolAuth] Bind to run skipped because auth context is already available source=${
-                                existingRunAuth ? "run" : "session"
-                            } ${debugState}`,
-                        );
-                    } else {
-                        api.logger.debug?.(
-                            `[WeChat ToolAuth] Failed to bind auth to run ${debugState}`,
-                        );
-                    }
-                }
                 return;
             }, { priority: 100 });
 
@@ -3409,8 +3872,16 @@ const plugin = {
                 })) {
                     return;
                 }
-                const runBoundAuth = effectiveRunId ? getWechatToolAuthForRun(effectiveRunId) : undefined;
-                const sessionBoundAuth = effectiveSessionKey ? getWechatToolAuthForSession(effectiveSessionKey) : undefined;
+                let runBoundAuth = effectiveRunId ? getWechatToolAuthForRun(effectiveRunId) : undefined;
+                let sessionBoundAuth = effectiveSessionKey ? getWechatToolAuthForSession(effectiveSessionKey) : undefined;
+                if (!runBoundAuth && !sessionBoundAuth && effectiveRunId && effectiveSessionKey) {
+                    runBoundAuth = tryBindWechatToolAuthForRun({
+                        ctx: ctx as Record<string, unknown>,
+                        hookName: "before_tool_call",
+                        runId: effectiveRunId,
+                    });
+                    sessionBoundAuth = effectiveSessionKey ? getWechatToolAuthForSession(effectiveSessionKey) : undefined;
+                }
                 let authContext = runBoundAuth ?? sessionBoundAuth;
                 let authContextSource: "run" | "session" | "chat" | undefined =
                     runBoundAuth ? "run" : (sessionBoundAuth ? "session" : undefined);
@@ -3475,7 +3946,12 @@ const plugin = {
                         return;
                     }
 
-                    const fallbackNoticeContext = resolveWechatFallbackNoticeContextFromSessionKey(effectiveSessionKey);
+                    const recordedFallbackAuth = effectiveSessionKey
+                        ? getWechatToolAuthFallbackForSession(effectiveSessionKey)
+                        : undefined;
+                    const fallbackNoticeContext = recordedFallbackAuth
+                        ? resolveWechatFallbackNoticeContextFromSessionKey(effectiveSessionKey)
+                        : null;
                     const sentBlockedNotice = Boolean(
                         fallbackNoticeContext && shouldSendWechatToolAuthNotice(bridgeConfig, {
                             state: "blocked",
@@ -3493,15 +3969,22 @@ const plugin = {
                                 config: bridgeConfig,
                             }),
                         );
-                    } else if (!fallbackNoticeContext && claimWechatToolAuthLogDedup({
-                        kind: "missing-auth-context-no-notice-context",
-                        runId: effectiveRunId,
-                        toolName,
-                        detail: effectiveSessionKey || "",
-                    })) {
-                        api.logger.warn?.(
-                            `[WeChat ToolAuth] Missing auth context and could not resolve fallback notice context tool=${toolName} sessionKey=${effectiveSessionKey || ""} runId=${effectiveRunId || ""}`,
-                        );
+                    } else if (!fallbackNoticeContext) {
+                        const missingNoticeDetail = recordedFallbackAuth
+                            ? effectiveSessionKey || ""
+                            : `${effectiveSessionKey || ""}|synthetic-suppressed`;
+                        if (claimWechatToolAuthLogDedup({
+                            kind: "missing-auth-context-no-notice-context",
+                            runId: effectiveRunId,
+                            toolName,
+                            detail: missingNoticeDetail,
+                        })) {
+                            api.logger.warn?.(
+                                recordedFallbackAuth
+                                    ? `[WeChat ToolAuth] Missing auth context and could not resolve fallback notice context tool=${toolName} sessionKey=${effectiveSessionKey || ""} runId=${effectiveRunId || ""}`
+                                    : `[WeChat ToolAuth] Missing auth context for guarded tool; suppressing synthetic fallback notice tool=${toolName} sessionKey=${effectiveSessionKey || ""} runId=${effectiveRunId || ""}`,
+                            );
+                        }
                     }
 
                     if (effectiveSessionKey) {
