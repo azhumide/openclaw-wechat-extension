@@ -354,7 +354,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
             }
 
             const runtime = getWechatRuntime();
-            const cfg = runtime?.config.loadConfig?.() || {};
+            const cfg = runtime?.config.current?.() || {};
             const bridgeConfig = resolveWechatExtensionConfig(cfg, (runtime as any)?.logger ?? console);
             const to = readStringParam(params, "to") ?? readStringParam(params, "target", { required: true });
             const { emoji, remove, isEmpty } = readReactionParams(params, {
@@ -413,7 +413,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
         deliveryMode: "direct",
         sendText: async ({ to, text, accountId, msg_id, original_msg_id, messageId, replyToId }: any) => {
             const runtime = getWechatRuntime();
-            const cfg = runtime?.config.loadConfig?.() || {};
+            const cfg = runtime?.config.current?.() || {};
             const bridgeConfig = resolveWechatExtensionConfig(cfg, (runtime as any)?.logger ?? console);
             const safeText = redactWechatOutboundText(text, bridgeConfig);
             const callbackMsgId =
@@ -444,7 +444,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
         },
         sendMedia: async ({ to, mediaUrl, text, accountId, msg_id, original_msg_id, messageId, replyToId }: any) => {
             const runtime = getWechatRuntime();
-            const cfg = runtime.config.loadConfig();
+            const cfg = runtime.config.current();
             const bridgeConfig = resolveWechatExtensionConfig(cfg, (runtime as any).logger ?? console);
             const safeText = typeof text === "string" ? redactWechatOutboundText(text, bridgeConfig) : text;
             const callbackMsgId =

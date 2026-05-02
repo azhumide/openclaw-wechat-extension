@@ -1185,7 +1185,10 @@ function resolveWechatCommandPathCandidate(token: string, workdir?: string): str
         return null;
     }
     const expanded = raw.startsWith("~")
-        ? path.join(process.env.HOME || process.env.USERPROFILE || "", raw.slice(1))
+        ? path.join(
+              process.env.HOME || process.env.USERPROFILE || "",
+              raw.length > 1 && (raw[1] === "/" || raw[1] === "\\") ? raw.slice(2) : raw.slice(1)
+          )
         : raw;
     const baseDir = workdir?.trim() ? workdir : process.cwd();
     return path.resolve(baseDir, expanded);
@@ -1550,6 +1553,16 @@ function resolveWechatSkillExecSegment(params: {
     });
 
     if (hasInlineEvalFlag) {
+        for (const skillId of params.skillIds) {
+            if (params.segment.includes(skillId)) {
+                return {
+                    matched: true,
+                    reason: "inline-eval-fallback",
+                    skillId: skillId,
+                    segment: params.segment,
+                };
+            }
+        }
         return { matched: false };
     }
 
@@ -2236,7 +2249,7 @@ async function sendWechatToolAuthNotice(api: OpenClawPluginApi, authContext: {
         return;
     }
     try {
-        const cfg = api.runtime.config.loadConfig();
+        const cfg = api.runtime.config.current();
         await wechatPlugin.outbound?.sendText?.({
             to,
             text: trimmedText,
@@ -2484,7 +2497,7 @@ function handleBridgeHttpRequest(api: OpenClawPluginApi, req: IncomingMessage, r
     if (req.url && req.url.startsWith("/media/")) {
         const filePath = restoreServedFilePath(req.url.slice("/media/".length));
         try {
-            const allowedRoots = resolveWechatMediaServeRoots(api.runtime.config.loadConfig(), api.logger);
+            const allowedRoots = resolveWechatMediaServeRoots(api.runtime.config.current(), api.logger);
             if (!isPathWithinRoots(filePath, allowedRoots)) {
                 api.logger.warning?.(
                     `[WeChat] /media forbidden: url=${req.url} filePath=${filePath} allowedRoots=${allowedRoots.join(" | ")}`,
@@ -2672,7 +2685,7 @@ async function ensureBridgeStarted(api: OpenClawPluginApi) {
 
     const performStart = async () => {
         const runtime = api.runtime;
-        const cfg = runtime.config.loadConfig();
+        const cfg = runtime.config.current();
         const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
         const wsConfig: WechatBridgeWsConfig = {
             host: bridgeConfig.wsHost,
@@ -2930,7 +2943,7 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
     } = body;
 
     const runtime = api.runtime;
-    const cfg = runtime.config.loadConfig();
+    const cfg = runtime.config.current();
 
     if (runtime.channel.activity?.record) {
         runtime.channel.activity.record({
@@ -3347,12 +3360,20 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 // Track all text seen in this specific turn across all dispatcher calls
                 // Read-only here, updates belong to onPartialReply
                 let currentIncomingText = textFromArg0 || payload.text || payload.message || payload.content || payload.answer || payload.stdout || payload.result || payload.output || payload.data || "";
+                if (typeof currentIncomingText === 'string') {
+                    currentIncomingText = currentIncomingText.replace(/^(?:MEDIA|FILE):?\s*$/gmi, "").trim();
+                }
                 
                 if (!currentIncomingText && Array.isArray(payload.blocks)) {
-                    currentIncomingText = payload.blocks
-                        .map((b: any) => (typeof b === "string" ? b : (b.text || b.content || "")))
-                        .filter(Boolean)
-                        .join("\n\n");
+                    let combined = "";
+                    for (const b of payload.blocks) {
+                        let bTxt = typeof b === "string" ? b : (b.text || b.content || "");
+                        bTxt = bTxt.trim();
+                        // Ignore pure placeholder text inserted by OpenClaw/Dify that breaks deduplication
+                        if (!bTxt || bTxt === "MEDIA" || bTxt === "FILE") continue;
+                        combined = mergeOverlappingStrings(combined, bTxt);
+                    }
+                    currentIncomingText = combined;
                 }
                 
                 if (currentIncomingText) {
@@ -3393,10 +3414,10 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                     : undefined;
                 if (blockedReply?.noticeSent) {
                     api.logger.info(
-                        `[WeChat] Suppressing reply after tool-auth block sessionKey=${blockedReply.sessionKey} ` +
+                        `[WeChat] Not suppressing reply after tool-auth block sessionKey=${blockedReply.sessionKey} ` +
                         `reason=${blockedReply.reason || "unknown"} tool=${blockedReply.toolName || ""}`,
                     );
-                    return;
+                    // Let the model's natural response through
                 }
 
                 // Deduplication logic:
@@ -3450,8 +3471,10 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 let textToProcess = extractedBareMedia.text;
                 
                 // [Crucial Check] If we already sent this exact line, skip it
-                if (textToProcess.trim() && cumulativeSentText.includes(textToProcess.trim())) {
-                    api.logger.info(`[WeChat] Skipping redundant block text: "${textToProcess.trim().substring(0, 20)}..."`);
+                // Normalize whitespace before comparison to catch block vs final formatting differences
+                const normalizeWs = (s: string) => s.replace(/\s+/g, " ").trim();
+                if (textToProcess.trim() && normalizeWs(cumulativeSentText).includes(normalizeWs(textToProcess))) {
+                    api.logger.info(`[WeChat] Skipping redundant ${info.kind} text (ws-normalized match): "${textToProcess.trim().substring(0, 30)}..."`);
                     textToProcess = ""; 
                 }
 
@@ -3621,11 +3644,15 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
             },
         },
         replyOptions: {
+            sourceReplyDeliveryMode: "automatic",
             onPartialReply: (payload) => {
-                const txt = payload.text || payload.content || payload.message || payload.answer || "";
+                let txt = payload.text || payload.content || payload.message || payload.answer || "";
                 if (txt && typeof txt === 'string') {
-                    // 使用智能重叠合并，防止 AI 重复输出前缀导致的翻倍
-                    turnTextSeen = mergeOverlappingStrings(turnTextSeen, txt);
+                    txt = txt.replace(/^(?:MEDIA|FILE):?\s*$/gmi, "").trim();
+                    if (txt) {
+                        // 使用智能重叠合并，防止 AI 重复输出前缀导致的翻倍
+                        turnTextSeen = mergeOverlappingStrings(turnTextSeen, txt);
+                    }
                 }
             }
         }
@@ -3646,6 +3673,9 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
         const internalCheck = isWechatInternalStatusReply(unseenText);
         const hasNoReply = unseenText.toUpperCase().includes("NO_REPLY");
+        const blockedReply = typeof sessionKey === "string"
+            ? getWechatBlockedReplyForSession(sessionKey)
+            : undefined;
         if (!internalCheck.matched && !hasNoReply) {
             api.logger.info(
                 `[WeChat] Fallback: deliver never sent text but onPartialReply captured content, sending now ` +
@@ -3857,7 +3887,7 @@ const plugin = {
             }, { priority: 100 });
 
             api.on("before_tool_call", (event, ctx) => {
-                const cfg = api.runtime.config.loadConfig();
+                const cfg = api.runtime.config.current();
                 const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
                 const guardedTools = normalizeGuardedToolNameList(bridgeConfig.nonOwnerToolAuthTools);
                 const bypassWxids = normalizeWechatIdAllowList(bridgeConfig.toolAuthBypassWxids);
@@ -3866,6 +3896,28 @@ const plugin = {
                 const toolSpecificBypassWxids = getWechatToolSpecificAllowList(bridgeConfig, toolName);
                 const effectiveRunId = ctx.runId?.trim() || event.runId?.trim();
                 const effectiveSessionKey = resolveWechatContextSessionKey(ctx as Record<string, unknown>);
+
+                // [Auto-inject channel] 当 AI 在 WeChat 会话中调用 message 工具但未指定 channel 时，
+                // 自动注入 channel: "wechat"，防止多渠道配置下的 "Channel is required" 错误。
+                if (
+                    toolName === "message" &&
+                    effectiveSessionKey &&
+                    effectiveSessionKey.includes(":wechat:") &&
+                    event.params &&
+                    typeof event.params === "object" &&
+                    !((event.params as any).channel)
+                ) {
+                    api.logger.info(
+                        `[WeChat] Auto-injecting channel=wechat for message tool call session=${effectiveSessionKey}`,
+                    );
+                    return {
+                        params: {
+                            ...event.params,
+                            channel: "wechat",
+                        },
+                    };
+                }
+
                 if (!shouldApplyWechatToolAuth({
                     sessionKey: effectiveSessionKey,
                     runId: effectiveRunId,
@@ -3924,6 +3976,38 @@ const plugin = {
 
                 if (!guardedTools.has(toolName)) {
                     return;
+                }
+
+                // [System-safe path bypass] Allow write/read to internal system paths
+                // regardless of sender authorization. These are typically triggered by
+                // OpenClaw's compaction/memory flush/dreaming/bootstrap, not by user actions.
+                // Without this, the auth system incorrectly attributes system tasks to
+                // the last group chat sender and blocks legitimate maintenance operations.
+                //
+                // Covered paths:
+                //   memory/          – daily memory logs (compaction memoryFlush)
+                //   MEMORY.md        – persistent memory (AI self-management)
+                //   DREAMS.md        – dreaming plugin output
+                //   AGENTS.md        – agent reference (bootstrap)
+                //   SOUL.md          – agent personality (bootstrap)
+                //   TOOLS.md         – tools reference (bootstrap)
+                //   BOOT.md          – boot hook output
+                if (toolName === "write" || toolName === "read") {
+                    const targetPath = String((event.params as any)?.path || "").trim().replace(/\\/g, "/");
+                    const systemSafePrefixes = ["memory/", "memory"];
+                    const systemSafeFiles = [
+                        "MEMORY.md", "DREAMS.md", "AGENTS.md",
+                        "SOUL.md", "TOOLS.md", "BOOT.md",
+                    ];
+                    const isSystemSafe =
+                        systemSafePrefixes.some((p) => targetPath === p || targetPath.startsWith(p + (p.endsWith("/") ? "" : "/"))) ||
+                        systemSafeFiles.some((f) => targetPath === f || targetPath.endsWith("/" + f));
+                    if (isSystemSafe) {
+                        api.logger.info(
+                            `[WeChat ToolAuth] System-safe path bypass tool=${toolName} path="${targetPath}" session=${effectiveSessionKey || ""}`,
+                        );
+                        return;
+                    }
                 }
 
                 if (!authContext) {
@@ -3998,7 +4082,7 @@ const plugin = {
 
                     return {
                         block: true,
-                        blockReason: `WeChat tool auth context missing for guarded tool ${toolName}; refusing to continue.`,
+                        blockReason: `WeChat tool auth context missing for guarded tool ${toolName}; refusing to continue. Please politely inform the user that execution cannot proceed.`,
                     };
                 }
 
@@ -4049,12 +4133,12 @@ const plugin = {
                         : undefined;
                 const isInstalledSkillProcessSession =
                     toolName === "process" &&
-                    allowBypassForAuthContext &&
                     bridgeConfig.toolAuthAllowInstalledSkills &&
                     Boolean(processSessionId) &&
                     Boolean(installedSkillProcessSession);
                 const isInstalledSkillBypass =
-                    allowBypassForAuthContext && (installedSkillMatch.matched || isInstalledSkillProcessSession);
+                    bridgeConfig.toolAuthAllowInstalledSkills &&
+                    (installedSkillMatch.matched || isInstalledSkillProcessSession);
                 const matchedSkillId =
                     (installedSkillMatch.skillId || installedSkillProcessSession?.skillId || "").trim().toLowerCase();
                 const blockedSkillId =
@@ -4155,7 +4239,7 @@ const plugin = {
                     }
                     return {
                         block: true,
-                        blockReason: `WeChat sender ${authContext.senderId || "unknown"} is not authorized to use blocked skill ${blockedSkillId} via ${toolName}.`,
+                        blockReason: `WeChat sender ${authContext.senderId || "unknown"} is not authorized to use blocked skill ${blockedSkillId} via ${toolName}. Please politely inform the user that they do not have permission.`,
                     };
                 }
 
@@ -4195,6 +4279,35 @@ const plugin = {
                     return;
                 }
 
+                // [Safe-download bypass] Allow exec commands that ONLY contain curl/wget
+                // downloading files to the workspace directory. This commonly occurs after
+                // image generation skills (doubao-image, gpt-image-2) produce CDN URLs
+                // that the AI then downloads with curl. Since curl is not in any skill
+                // directory, installedSkillMatch fails, but the operation is safe.
+                if (toolName === "exec" && execCommand) {
+                    const downloadSegments = execCommand.split(/\n/).map((s) => s.trim()).filter(Boolean);
+                    const workspaceBase = bridgeConfig.workspaceBase || "/home/rs/.openclaw/workspace";
+                    const safeDownloadPattern = /^(?:curl\s+-[oO]|curl\s+.*-[oO]\s|wget\s+-O\s|wget\s+.*-O\s)/;
+                    const allSafeDownloads = downloadSegments.length > 0 && downloadSegments.every((seg) => {
+                        if (!safeDownloadPattern.test(seg)) return false;
+                        // Extract -o/-O target path and verify it's within workspace
+                        const outputMatch = seg.match(/-[oO]\s+["']?([^\s"']+)/);
+                        return outputMatch && outputMatch[1].startsWith(workspaceBase);
+                    });
+                    if (allSafeDownloads) {
+                        api.logger.info(
+                            `[WeChat ToolAuth] Safe-download bypass tool=exec segments=${downloadSegments.length} ` +
+                            `target="${summarizeWechatTextForLog(downloadSegments[0], 120)}" ${authSummary}`,
+                        );
+                        return {
+                            params: {
+                                ...event.params,
+                                ask: "off",
+                            },
+                        };
+                    }
+                }
+
                 if (bridgeConfig.nonOwnerToolAuthMode === "deny") {
                     if (claimWechatToolAuthLogDedup({
                         kind: "denied-tool",
@@ -4232,7 +4345,7 @@ const plugin = {
                     }
                     return {
                         block: true,
-                        blockReason: `WeChat sender ${authContext.senderId || "unknown"} is not authorized to use ${toolName}.`,
+                        blockReason: `WeChat sender ${authContext.senderId || "unknown"} is not authorized to use ${toolName}. Please politely inform the user that they do not have permission.`,
                     };
                 }
 
@@ -4331,7 +4444,7 @@ const plugin = {
                     return;
                 }
 
-                const cfg = api.runtime.config.loadConfig();
+                const cfg = api.runtime.config.current();
                 const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
                 if (!bridgeConfig.toolAuthAllowInstalledSkills) {
                     return;

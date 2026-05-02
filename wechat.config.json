@@ -13,7 +13,7 @@
     "xdoufux"
   ],
   "nonOwnerToolAuthMode": "deny",
-  "nonOwnerToolAuthTools": ["exec", "process", "write"],
+  "nonOwnerToolAuthTools": ["exec", "write"],
   "toolAuthBypassWxids": [
     "wxid_9uwska6u4yzm22"
   ],
