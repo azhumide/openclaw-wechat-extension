@@ -1,0 +1,80 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.a = isSubagentSessionKey;exports.c = parseThreadSessionSuffix;exports.i = isCronSessionKey;exports.n = isAcpSessionKey;exports.o = parseAgentSessionKey;exports.r = isCronRunSessionKey;exports.s = parseRawSessionConversationRef;exports.t = getSubagentDepth;var _stringCoerceBje8XVt = require("./string-coerce-Bje8XVt9.js");
+//#region src/sessions/session-key-utils.ts
+/**
+* Parse agent-scoped session keys in a canonical, case-insensitive way.
+* Returned values are normalized to lowercase for stable comparisons/routing.
+*/
+function parseAgentSessionKey(sessionKey) {
+  const raw = (0, _stringCoerceBje8XVt.s)(sessionKey);
+  if (!raw) return null;
+  const parts = raw.split(":").filter(Boolean);
+  if (parts.length < 3) return null;
+  if (parts[0] !== "agent") return null;
+  const agentId = (0, _stringCoerceBje8XVt.c)(parts[1]);
+  const rest = parts.slice(2).join(":");
+  if (!agentId || !rest) return null;
+  return {
+    agentId,
+    rest
+  };
+}
+function isCronRunSessionKey(sessionKey) {
+  const parsed = parseAgentSessionKey(sessionKey);
+  if (!parsed) return false;
+  return /^cron:[^:]+:run:[^:]+$/.test(parsed.rest);
+}
+function isCronSessionKey(sessionKey) {
+  const parsed = parseAgentSessionKey(sessionKey);
+  if (!parsed) return false;
+  return (0, _stringCoerceBje8XVt.s)(parsed.rest)?.startsWith("cron:") === true;
+}
+function isSubagentSessionKey(sessionKey) {
+  const raw = (0, _stringCoerceBje8XVt.c)(sessionKey);
+  if (!raw) return false;
+  if ((0, _stringCoerceBje8XVt.s)(raw)?.startsWith("subagent:")) return true;
+  return (0, _stringCoerceBje8XVt.s)(parseAgentSessionKey(raw)?.rest)?.startsWith("subagent:") === true;
+}
+function getSubagentDepth(sessionKey) {
+  const raw = (0, _stringCoerceBje8XVt.s)(sessionKey);
+  if (!raw) return 0;
+  return raw.split(":subagent:").length - 1;
+}
+function isAcpSessionKey(sessionKey) {
+  const raw = (0, _stringCoerceBje8XVt.c)(sessionKey);
+  if (!raw) return false;
+  if ((0, _stringCoerceBje8XVt.a)(raw).startsWith("acp:")) return true;
+  return (0, _stringCoerceBje8XVt.s)(parseAgentSessionKey(raw)?.rest)?.startsWith("acp:") === true;
+}
+function parseThreadSessionSuffix(sessionKey) {
+  const raw = (0, _stringCoerceBje8XVt.c)(sessionKey);
+  if (!raw) return {
+    baseSessionKey: void 0,
+    threadId: void 0
+  };
+  const markerIndex = (0, _stringCoerceBje8XVt.a)(raw).lastIndexOf(":thread:");
+  return {
+    baseSessionKey: markerIndex === -1 ? raw : raw.slice(0, markerIndex),
+    threadId: (0, _stringCoerceBje8XVt.c)(markerIndex === -1 ? void 0 : raw.slice(markerIndex + 8))
+  };
+}
+function parseRawSessionConversationRef(sessionKey) {
+  const raw = (0, _stringCoerceBje8XVt.c)(sessionKey);
+  if (!raw) return null;
+  const rawParts = raw.split(":").filter(Boolean);
+  const bodyStartIndex = rawParts.length >= 3 && (0, _stringCoerceBje8XVt.s)(rawParts[0]) === "agent" ? 2 : 0;
+  const parts = rawParts.slice(bodyStartIndex);
+  if (parts.length < 3) return null;
+  const channel = (0, _stringCoerceBje8XVt.s)(parts[0]);
+  const kind = (0, _stringCoerceBje8XVt.s)(parts[1]);
+  if (!channel || kind !== "group" && kind !== "channel") return null;
+  const rawId = (0, _stringCoerceBje8XVt.c)(parts.slice(2).join(":"));
+  const prefix = (0, _stringCoerceBje8XVt.c)(rawParts.slice(0, bodyStartIndex + 2).join(":"));
+  if (!rawId || !prefix) return null;
+  return {
+    channel,
+    kind,
+    rawId,
+    prefix
+  };
+}
+//#endregion /* v9-56deb1fcc2e7955e */

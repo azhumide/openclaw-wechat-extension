@@ -1,0 +1,476 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.a = resolveInboundLastRouteSessionKey;exports.i = resolveAgentRoute;exports.n = deriveLastRoutePolicy;exports.r = pickFirstExistingAgentId;exports.t = buildAgentSessionKey;var _stringCoerceBje8XVt = require("./string-coerce-Bje8XVt9.js");
+var _globals8N5C2Ov_ = require("./globals-8N5C2Ov_.js");
+var _loggerDzNKIQlP = require("./logger-DzNKIQlP.js");
+var _accountIdCRE2SEcy = require("./account-id-CRE2SEcy.js");
+var _sessionKeyC6FNnIG = require("./session-key-C6F-NnIG.js");
+var _agentScopeRNt6KatQ = require("./agent-scope-RNt6KatQ.js");
+var _chatTypeDuQW6e8F = require("./chat-type-DuQW6e8F.js");
+var _bindingScopeRJ1r7OuN = require("./binding-scope-RJ1r7OuN.js");
+var _bindingsTwJsBQSc = require("./bindings-TwJsBQSc.js");
+var _peerKindMatchDjXGM4da = require("./peer-kind-match-DjXGM4da.js");
+//#region src/routing/resolve-route.ts
+function deriveLastRoutePolicy(params) {
+  return params.sessionKey === params.mainSessionKey ? "main" : "session";
+}
+function resolveInboundLastRouteSessionKey(params) {
+  return params.route.lastRoutePolicy === "main" ? params.route.mainSessionKey : params.sessionKey;
+}
+function normalizeToken(value) {
+  return (0, _stringCoerceBje8XVt.a)(value);
+}
+function normalizeId(value) {
+  return (0, _bindingScopeRJ1r7OuN.n)(value);
+}
+function buildAgentSessionKey(params) {
+  const channel = normalizeToken(params.channel) || "unknown";
+  const peer = params.peer;
+  return (0, _sessionKeyC6FNnIG.i)({
+    agentId: params.agentId,
+    mainKey: _sessionKeyC6FNnIG.n,
+    channel,
+    accountId: params.accountId,
+    peerKind: peer?.kind ?? "direct",
+    peerId: peer ? normalizeId(peer.id) || "unknown" : null,
+    dmScope: params.dmScope,
+    identityLinks: params.identityLinks
+  });
+}
+function listAgents(cfg) {
+  const agents = cfg.agents?.list;
+  return Array.isArray(agents) ? agents : [];
+}
+const agentLookupCacheByCfg = /* @__PURE__ */new WeakMap();
+function resolveAgentLookupCache(cfg) {
+  const agentsRef = cfg.agents;
+  const existing = agentLookupCacheByCfg.get(cfg);
+  if (existing && existing.agentsRef === agentsRef) return existing;
+  const byNormalizedId = /* @__PURE__ */new Map();
+  for (const agent of listAgents(cfg)) {
+    const rawId = agent.id?.trim();
+    if (!rawId) continue;
+    byNormalizedId.set((0, _sessionKeyC6FNnIG.c)(rawId), (0, _sessionKeyC6FNnIG.f)(rawId));
+  }
+  const next = {
+    agentsRef,
+    byNormalizedId,
+    fallbackDefaultAgentId: (0, _sessionKeyC6FNnIG.f)((0, _agentScopeRNt6KatQ.S)(cfg))
+  };
+  agentLookupCacheByCfg.set(cfg, next);
+  return next;
+}
+function pickFirstExistingAgentId(cfg, agentId) {
+  const lookup = resolveAgentLookupCache(cfg);
+  const trimmed = (agentId ?? "").trim();
+  if (!trimmed) return lookup.fallbackDefaultAgentId;
+  const normalized = (0, _sessionKeyC6FNnIG.c)(trimmed);
+  if (lookup.byNormalizedId.size === 0) return (0, _sessionKeyC6FNnIG.f)(trimmed);
+  const resolved = lookup.byNormalizedId.get(normalized);
+  if (resolved) return resolved;
+  return lookup.fallbackDefaultAgentId;
+}
+const evaluatedBindingsCacheByCfg = /* @__PURE__ */new WeakMap();
+const MAX_EVALUATED_BINDINGS_CACHE_KEYS = 2e3;
+const resolvedRouteCacheByCfg = /* @__PURE__ */new WeakMap();
+const MAX_RESOLVED_ROUTE_CACHE_KEYS = 4e3;
+function resolveAccountPatternKey(accountPattern) {
+  if (!accountPattern.trim()) return _accountIdCRE2SEcy.t;
+  return (0, _accountIdCRE2SEcy.n)(accountPattern);
+}
+function buildEvaluatedBindingsByChannel(cfg) {
+  const byChannel = /* @__PURE__ */new Map();
+  let order = 0;
+  for (const binding of (0, _bindingsTwJsBQSc.n)(cfg)) {
+    if (!binding || typeof binding !== "object") continue;
+    const channel = normalizeToken(binding.match?.channel);
+    if (!channel) continue;
+    const match = normalizeBindingMatch(binding.match);
+    const evaluated = {
+      binding,
+      match,
+      order
+    };
+    order += 1;
+    let bucket = byChannel.get(channel);
+    if (!bucket) {
+      bucket = {
+        byAccount: /* @__PURE__ */new Map(),
+        byAnyAccount: []
+      };
+      byChannel.set(channel, bucket);
+    }
+    if (match.accountPattern === "*") {
+      bucket.byAnyAccount.push(evaluated);
+      continue;
+    }
+    const accountKey = resolveAccountPatternKey(match.accountPattern);
+    const existing = bucket.byAccount.get(accountKey);
+    if (existing) {
+      existing.push(evaluated);
+      continue;
+    }
+    bucket.byAccount.set(accountKey, [evaluated]);
+  }
+  return byChannel;
+}
+function mergeEvaluatedBindingsInSourceOrder(accountScoped, anyAccount) {
+  if (accountScoped.length === 0) return anyAccount;
+  if (anyAccount.length === 0) return accountScoped;
+  const merged = [];
+  let accountIdx = 0;
+  let anyIdx = 0;
+  while (accountIdx < accountScoped.length && anyIdx < anyAccount.length) {
+    const accountBinding = accountScoped[accountIdx];
+    const anyBinding = anyAccount[anyIdx];
+    if ((accountBinding?.order ?? Number.MAX_SAFE_INTEGER) <= (anyBinding?.order ?? Number.MAX_SAFE_INTEGER)) {
+      if (accountBinding) merged.push(accountBinding);
+      accountIdx += 1;
+      continue;
+    }
+    if (anyBinding) merged.push(anyBinding);
+    anyIdx += 1;
+  }
+  if (accountIdx < accountScoped.length) merged.push(...accountScoped.slice(accountIdx));
+  if (anyIdx < anyAccount.length) merged.push(...anyAccount.slice(anyIdx));
+  return merged;
+}
+function pushToIndexMap(map, key, binding) {
+  if (!key) return;
+  const existing = map.get(key);
+  if (existing) {
+    existing.push(binding);
+    return;
+  }
+  map.set(key, [binding]);
+}
+function peerLookupKeys(kind, id) {
+  if (kind === "group") return [`group:${id}`, `channel:${id}`];
+  if (kind === "channel") return [`channel:${id}`, `group:${id}`];
+  return [`${kind}:${id}`];
+}
+function collectPeerIndexedBindings(index, peer) {
+  if (!peer) return [];
+  const out = [];
+  const seen = /* @__PURE__ */new Set();
+  for (const key of peerLookupKeys(peer.kind, peer.id)) {
+    const matches = index.byPeer.get(key);
+    if (!matches) continue;
+    for (const match of matches) {
+      if (seen.has(match)) continue;
+      seen.add(match);
+      out.push(match);
+    }
+  }
+  return out;
+}
+function buildEvaluatedBindingsIndex(bindings) {
+  const byPeer = /* @__PURE__ */new Map();
+  const byPeerWildcard = [];
+  const byGuildWithRoles = /* @__PURE__ */new Map();
+  const byGuild = /* @__PURE__ */new Map();
+  const byTeam = /* @__PURE__ */new Map();
+  const byAccount = [];
+  const byChannel = [];
+  for (const binding of bindings) {
+    if (binding.match.peer.state === "valid") {
+      for (const key of peerLookupKeys(binding.match.peer.kind, binding.match.peer.id)) pushToIndexMap(byPeer, key, binding);
+      continue;
+    }
+    if (binding.match.peer.state === "wildcard-kind") {
+      byPeerWildcard.push(binding);
+      continue;
+    }
+    if (binding.match.guildId && binding.match.roles) {
+      pushToIndexMap(byGuildWithRoles, binding.match.guildId, binding);
+      continue;
+    }
+    if (binding.match.guildId && !binding.match.roles) {
+      pushToIndexMap(byGuild, binding.match.guildId, binding);
+      continue;
+    }
+    if (binding.match.teamId) {
+      pushToIndexMap(byTeam, binding.match.teamId, binding);
+      continue;
+    }
+    if (binding.match.accountPattern !== "*") {
+      byAccount.push(binding);
+      continue;
+    }
+    byChannel.push(binding);
+  }
+  return {
+    byPeer,
+    byPeerWildcard,
+    byGuildWithRoles,
+    byGuild,
+    byTeam,
+    byAccount,
+    byChannel
+  };
+}
+function getEvaluatedBindingsForChannelAccount(cfg, channel, accountId) {
+  const bindingsRef = cfg.bindings;
+  const existing = evaluatedBindingsCacheByCfg.get(cfg);
+  const cache = existing && existing.bindingsRef === bindingsRef ? existing : {
+    bindingsRef,
+    byChannel: buildEvaluatedBindingsByChannel(cfg),
+    byChannelAccount: /* @__PURE__ */new Map(),
+    byChannelAccountIndex: /* @__PURE__ */new Map()
+  };
+  if (cache !== existing) evaluatedBindingsCacheByCfg.set(cfg, cache);
+  const cacheKey = `${channel}\t${accountId}`;
+  const hit = cache.byChannelAccount.get(cacheKey);
+  if (hit) return hit;
+  const channelBindings = cache.byChannel.get(channel);
+  const evaluated = mergeEvaluatedBindingsInSourceOrder(channelBindings?.byAccount.get(accountId) ?? [], channelBindings?.byAnyAccount ?? []);
+  cache.byChannelAccount.set(cacheKey, evaluated);
+  cache.byChannelAccountIndex.set(cacheKey, buildEvaluatedBindingsIndex(evaluated));
+  if (cache.byChannelAccount.size > MAX_EVALUATED_BINDINGS_CACHE_KEYS) {
+    cache.byChannelAccount.clear();
+    cache.byChannelAccountIndex.clear();
+    cache.byChannelAccount.set(cacheKey, evaluated);
+    cache.byChannelAccountIndex.set(cacheKey, buildEvaluatedBindingsIndex(evaluated));
+  }
+  return evaluated;
+}
+function getEvaluatedBindingIndexForChannelAccount(cfg, channel, accountId) {
+  const bindings = getEvaluatedBindingsForChannelAccount(cfg, channel, accountId);
+  const existing = evaluatedBindingsCacheByCfg.get(cfg);
+  const cacheKey = `${channel}\t${accountId}`;
+  const indexed = existing?.byChannelAccountIndex.get(cacheKey);
+  if (indexed) return indexed;
+  const built = buildEvaluatedBindingsIndex(bindings);
+  existing?.byChannelAccountIndex.set(cacheKey, built);
+  return built;
+}
+function normalizePeerConstraint(peer) {
+  if (!peer) return { state: "none" };
+  const kind = (0, _chatTypeDuQW6e8F.t)(peer.kind);
+  const id = normalizeId(peer.id);
+  if (!kind || !id) return { state: "invalid" };
+  if (id === "*") return {
+    state: "wildcard-kind",
+    kind
+  };
+  return {
+    state: "valid",
+    kind,
+    id
+  };
+}
+function normalizeBindingMatch(match) {
+  const rawRoles = match?.roles;
+  return {
+    accountPattern: (match?.accountId ?? "").trim(),
+    peer: normalizePeerConstraint(match?.peer),
+    guildId: normalizeId(match?.guildId) || null,
+    teamId: normalizeId(match?.teamId) || null,
+    roles: (0, _bindingScopeRJ1r7OuN.r)(rawRoles)
+  };
+}
+function resolveRouteCacheForConfig(cfg) {
+  const existing = resolvedRouteCacheByCfg.get(cfg);
+  if (existing && existing.bindingsRef === cfg.bindings && existing.agentsRef === cfg.agents && existing.sessionRef === cfg.session) return existing.byKey;
+  const byKey = /* @__PURE__ */new Map();
+  resolvedRouteCacheByCfg.set(cfg, {
+    bindingsRef: cfg.bindings,
+    agentsRef: cfg.agents,
+    sessionRef: cfg.session,
+    byKey
+  });
+  return byKey;
+}
+function formatRouteCachePeer(peer) {
+  if (!peer || !peer.id) return "-";
+  return `${peer.kind}:${peer.id}`;
+}
+function formatRoleIdsCacheKey(roleIds) {
+  const count = roleIds.length;
+  if (count === 0) return "-";
+  if (count === 1) return roleIds[0] ?? "-";
+  if (count === 2) {
+    const first = roleIds[0] ?? "";
+    const second = roleIds[1] ?? "";
+    return first <= second ? `${first},${second}` : `${second},${first}`;
+  }
+  return roleIds.toSorted().join(",");
+}
+function buildResolvedRouteCacheKey(params) {
+  return `${params.channel}\t${params.accountId}\t${formatRouteCachePeer(params.peer)}\t${formatRouteCachePeer(params.parentPeer)}\t${params.guildId || "-"}\t${params.teamId || "-"}\t${formatRoleIdsCacheKey(params.memberRoleIds)}\t${params.dmScope}`;
+}
+function hasGuildConstraint(match) {
+  return Boolean(match.guildId);
+}
+function hasTeamConstraint(match) {
+  return Boolean(match.teamId);
+}
+function hasRolesConstraint(match) {
+  return Boolean(match.roles);
+}
+function matchesBindingScope(match, scope) {
+  if (match.peer.state === "invalid") return false;
+  if (match.peer.state === "valid") {
+    if (!scope.peer || !(0, _peerKindMatchDjXGM4da.t)(match.peer.kind, scope.peer.kind) || scope.peer.id !== match.peer.id) return false;
+  }
+  if (match.peer.state === "wildcard-kind") {
+    if (!scope.peer || !(0, _peerKindMatchDjXGM4da.t)(match.peer.kind, scope.peer.kind)) return false;
+  }
+  return (0, _bindingScopeRJ1r7OuN.a)(match, scope);
+}
+function resolveAgentRoute(input) {
+  const channel = normalizeToken(input.channel);
+  const accountId = (0, _accountIdCRE2SEcy.n)(input.accountId);
+  const peer = input.peer ? {
+    kind: (0, _chatTypeDuQW6e8F.t)(input.peer.kind) ?? input.peer.kind,
+    id: normalizeId(input.peer.id)
+  } : null;
+  const guildId = normalizeId(input.guildId);
+  const teamId = normalizeId(input.teamId);
+  const memberRoleIds = input.memberRoleIds ?? [];
+  const memberRoleIdSet = new Set(memberRoleIds);
+  const dmScope = input.cfg.session?.dmScope ?? "main";
+  const identityLinks = input.cfg.session?.identityLinks;
+  const shouldLogDebug = (0, _globals8N5C2Ov_.a)();
+  const parentPeer = input.parentPeer ? {
+    kind: (0, _chatTypeDuQW6e8F.t)(input.parentPeer.kind) ?? input.parentPeer.kind,
+    id: normalizeId(input.parentPeer.id)
+  } : null;
+  const routeCache = !shouldLogDebug && !identityLinks ? resolveRouteCacheForConfig(input.cfg) : null;
+  const routeCacheKey = routeCache ? buildResolvedRouteCacheKey({
+    channel,
+    accountId,
+    peer,
+    parentPeer,
+    guildId,
+    teamId,
+    memberRoleIds,
+    dmScope
+  }) : "";
+  if (routeCache && routeCacheKey) {
+    const cachedRoute = routeCache.get(routeCacheKey);
+    if (cachedRoute) return { ...cachedRoute };
+  }
+  const bindings = getEvaluatedBindingsForChannelAccount(input.cfg, channel, accountId);
+  const bindingsIndex = getEvaluatedBindingIndexForChannelAccount(input.cfg, channel, accountId);
+  const choose = (agentId, matchedBy, sessionOverride) => {
+    const resolvedAgentId = pickFirstExistingAgentId(input.cfg, agentId);
+    const sessionKey = (0, _stringCoerceBje8XVt.a)(buildAgentSessionKey({
+      agentId: resolvedAgentId,
+      channel,
+      accountId,
+      peer,
+      dmScope: sessionOverride?.dmScope ?? dmScope,
+      identityLinks
+    }));
+    const mainSessionKey = (0, _stringCoerceBje8XVt.a)((0, _sessionKeyC6FNnIG.r)({
+      agentId: resolvedAgentId,
+      mainKey: _sessionKeyC6FNnIG.n
+    }));
+    const route = {
+      agentId: resolvedAgentId,
+      channel,
+      accountId,
+      sessionKey,
+      mainSessionKey,
+      lastRoutePolicy: deriveLastRoutePolicy({
+        sessionKey,
+        mainSessionKey
+      }),
+      matchedBy
+    };
+    if (routeCache && routeCacheKey) {
+      routeCache.set(routeCacheKey, route);
+      if (routeCache.size > MAX_RESOLVED_ROUTE_CACHE_KEYS) {
+        routeCache.clear();
+        routeCache.set(routeCacheKey, route);
+      }
+    }
+    return route;
+  };
+  const formatPeer = (value) => value?.kind && value?.id ? `${value.kind}:${value.id}` : "none";
+  const formatNormalizedPeer = (value) => {
+    if (value.state === "none") return "none";
+    if (value.state === "invalid") return "invalid";
+    if (value.state === "wildcard-kind") return `${value.kind}:*`;
+    return `${value.kind}:${value.id}`;
+  };
+  if (shouldLogDebug) {
+    (0, _loggerDzNKIQlP.t)(`[routing] resolveAgentRoute: channel=${channel} accountId=${accountId} peer=${formatPeer(peer)} guildId=${guildId || "none"} teamId=${teamId || "none"} bindings=${bindings.length}`);
+    for (const entry of bindings) (0, _loggerDzNKIQlP.t)(`[routing] binding: agentId=${entry.binding.agentId} accountPattern=${entry.match.accountPattern || "default"} peer=${formatNormalizedPeer(entry.match.peer)} guildId=${entry.match.guildId ?? "none"} teamId=${entry.match.teamId ?? "none"} roles=${entry.match.roles?.length ?? 0}`);
+  }
+  const baseScope = {
+    guildId,
+    teamId,
+    memberRoleIds: memberRoleIdSet
+  };
+  const tiers = [
+  {
+    matchedBy: "binding.peer",
+    enabled: Boolean(peer),
+    scopePeer: peer,
+    candidates: collectPeerIndexedBindings(bindingsIndex, peer),
+    predicate: (candidate) => candidate.match.peer.state === "valid"
+  },
+  {
+    matchedBy: "binding.peer.parent",
+    enabled: Boolean(parentPeer && parentPeer.id),
+    scopePeer: parentPeer && parentPeer.id ? parentPeer : null,
+    candidates: collectPeerIndexedBindings(bindingsIndex, parentPeer),
+    predicate: (candidate) => candidate.match.peer.state === "valid"
+  },
+  {
+    matchedBy: "binding.peer.wildcard",
+    enabled: Boolean(peer),
+    scopePeer: peer,
+    candidates: bindingsIndex.byPeerWildcard,
+    predicate: (candidate) => candidate.match.peer.state === "wildcard-kind"
+  },
+  {
+    matchedBy: "binding.guild+roles",
+    enabled: Boolean(guildId && memberRoleIds.length > 0),
+    scopePeer: peer,
+    candidates: guildId ? bindingsIndex.byGuildWithRoles.get(guildId) ?? [] : [],
+    predicate: (candidate) => hasGuildConstraint(candidate.match) && hasRolesConstraint(candidate.match)
+  },
+  {
+    matchedBy: "binding.guild",
+    enabled: Boolean(guildId),
+    scopePeer: peer,
+    candidates: guildId ? bindingsIndex.byGuild.get(guildId) ?? [] : [],
+    predicate: (candidate) => hasGuildConstraint(candidate.match) && !hasRolesConstraint(candidate.match)
+  },
+  {
+    matchedBy: "binding.team",
+    enabled: Boolean(teamId),
+    scopePeer: peer,
+    candidates: teamId ? bindingsIndex.byTeam.get(teamId) ?? [] : [],
+    predicate: (candidate) => hasTeamConstraint(candidate.match)
+  },
+  {
+    matchedBy: "binding.account",
+    enabled: true,
+    scopePeer: peer,
+    candidates: bindingsIndex.byAccount,
+    predicate: (candidate) => candidate.match.accountPattern !== "*"
+  },
+  {
+    matchedBy: "binding.channel",
+    enabled: true,
+    scopePeer: peer,
+    candidates: bindingsIndex.byChannel,
+    predicate: (candidate) => candidate.match.accountPattern === "*"
+  }];
+
+  for (const tier of tiers) {
+    if (!tier.enabled) continue;
+    const matched = tier.candidates.find((candidate) => tier.predicate(candidate) && matchesBindingScope(candidate.match, {
+      ...baseScope,
+      peer: tier.scopePeer
+    }));
+    if (matched) {
+      if (shouldLogDebug) (0, _loggerDzNKIQlP.t)(`[routing] match: matchedBy=${tier.matchedBy} agentId=${matched.binding.agentId}`);
+      return choose(matched.binding.agentId, tier.matchedBy, matched.binding.session);
+    }
+  }
+  return choose((0, _agentScopeRNt6KatQ.S)(input.cfg), "default");
+}
+//#endregion /* v9-c70e438d4d996822 */

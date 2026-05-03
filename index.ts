@@ -2,13 +2,11 @@ import * as fs from "fs";
 import * as path from "path";
 import { Buffer } from "buffer";
 import { createHash } from "node:crypto";
-import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
-import type { Socket } from "node:net";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk/core";
 import { wechatPlugin } from "./src/channel.js";
-import { isPathWithinRoots, resolveWechatExtensionConfig, resolveWechatMediaServeRoots } from "./src/config.js";
+import { resolveWechatExtensionConfig } from "./src/config.js";
 import { redactWechatUnknownText, redactWechatWxids } from "./src/redaction.js";
 import {
     bindWechatToolAuthToRun,
@@ -35,11 +33,10 @@ import {
 } from "./src/runtime.js";
 
 // 这里的全局变量仅用于当前模块实例引用
-let bridgeHttpServer: HttpServer | null = null;
 let bridgeWss: WebSocketServer | null = null;
 let bridgeHeartbeatTimer: NodeJS.Timeout | null = null;
 let bridgeClosePromise: Promise<void> | null = null;
-const bridgeTcpSockets = new Set<Socket>();
+let bridgeClientReconnectTimer: NodeJS.Timeout | null = null;
 
 const globalSym = Symbol.for("openclaw.wechat.bridge.state");
 const DUPLICATE_REGISTER_RECOVERY_COOLDOWN_MS = 5_000;
@@ -54,7 +51,6 @@ type WechatBridgeGlobalState = {
     wsServer: WebSocketServer | null;
     activeSocket: WebSocket | null;
     lastPongAt: number;
-    httpServer: HttpServer | null;
     heartbeatTimer: NodeJS.Timeout | null;
     closing: boolean;
     startPromise: Promise<void> | null;
@@ -68,6 +64,7 @@ type WechatBridgeGlobalState = {
     recentToolNoticeAt: Map<string, number>;
     recentToolAuthLogAt: Map<string, number>;
     recentReplyMediaAt: Map<string, number>;
+    clientConnecting?: boolean;
 };
 
 function getGlobalState(): WechatBridgeGlobalState {
@@ -77,7 +74,6 @@ function getGlobalState(): WechatBridgeGlobalState {
     if (!("wsServer" in existing)) existing.wsServer = null;
     if (!("activeSocket" in existing)) existing.activeSocket = null;
     if (!("lastPongAt" in existing)) existing.lastPongAt = 0;
-    if (!("httpServer" in existing)) existing.httpServer = null;
     if (!("heartbeatTimer" in existing)) existing.heartbeatTimer = null;
     if (!("closing" in existing)) existing.closing = false;
     if (!("startPromise" in existing)) existing.startPromise = null;
@@ -91,6 +87,7 @@ function getGlobalState(): WechatBridgeGlobalState {
     if (!(existing.recentToolNoticeAt instanceof Map)) existing.recentToolNoticeAt = new Map<string, number>();
     if (!(existing.recentToolAuthLogAt instanceof Map)) existing.recentToolAuthLogAt = new Map<string, number>();
     if (!(existing.recentReplyMediaAt instanceof Map)) existing.recentReplyMediaAt = new Map<string, number>();
+    if (!("clientConnecting" in existing)) existing.clientConnecting = false;
     return existing as WechatBridgeGlobalState;
 }
 
@@ -105,26 +102,26 @@ function markWechatApiBound(api: OpenClawPluginApi): boolean {
 }
 
 function syncModuleRefsFromState(state = getGlobalState()) {
-    bridgeHttpServer = state.httpServer;
     bridgeWss = state.wsServer;
     bridgeHeartbeatTimer = state.heartbeatTimer;
 }
 
 function syncStateFromModuleRefs(state = getGlobalState()) {
-    state.httpServer = bridgeHttpServer;
     state.wsServer = bridgeWss;
     state.heartbeatTimer = bridgeHeartbeatTimer;
 }
 
 function clearModuleRefs() {
-    bridgeHttpServer = null;
     bridgeWss = null;
     bridgeHeartbeatTimer = null;
+    if (bridgeClientReconnectTimer) {
+        clearTimeout(bridgeClientReconnectTimer);
+        bridgeClientReconnectTimer = null;
+    }
 }
 
 function clearBridgeStateRefs(state = getGlobalState()) {
     clearModuleRefs();
-    state.httpServer = null;
     state.wsServer = null;
     state.heartbeatTimer = null;
     state.startPromise = null;
@@ -134,20 +131,28 @@ function formatBridgeStateSnapshot(state = getGlobalState()) {
     const activeSocket = getActiveBridgeSocket();
     return [
         `closing=${state.closing}`,
-        `hasHttp=${Boolean(state.httpServer)}`,
-        `httpListening=${Boolean(state.httpServer?.listening)}`,
+        `hasHttp=false`,
+        `httpListening=false`,
         `hasWs=${Boolean(state.wsServer)}`,
         `wsClients=${state.wsServer?.clients?.size ?? 0}`,
         `hasHeartbeat=${Boolean(state.heartbeatTimer)}`,
         `hasActiveSocket=${Boolean(activeSocket)}`,
         `activeSocketState=${activeSocket?.readyState ?? "none"}`,
-        `tcpSockets=${bridgeTcpSockets.size}`,
+        `clientConnecting=${Boolean(state.clientConnecting)}`,
         `hasClosePromise=${Boolean(bridgeClosePromise)}`,
     ].join(", ");
 }
 
 function logBridgeState(api: OpenClawPluginApi | undefined, phase: string, state = getGlobalState()) {
     api?.logger.debug?.(`[WeChat] Bridge state (${phase}): ${formatBridgeStateSnapshot(state)}`);
+}
+
+function hasActiveBridgeClient(state = getGlobalState()): boolean {
+    const activeSocket = getActiveBridgeSocket();
+    return Boolean(
+        state.clientConnecting ||
+        (activeSocket && activeSocket.readyState === WebSocket.OPEN),
+    );
 }
 
 function buildFrame(direction: "openclaw_to_bridge", event: "ping" | "pong", payload: Record<string, unknown> = {}) {
@@ -169,6 +174,17 @@ function restoreServedFilePath(rawPath: string): string {
 
 function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stripFalseWechatMediaFailureSuffix(text: string): {
+    text: string;
+    stripped: boolean;
+} {
+    const strippedText = text.replace(/\s*\n?⚠️ Media failed\.\s*$/u, "").trimEnd();
+    return {
+        text: strippedText,
+        stripped: strippedText !== text,
+    };
 }
 
 /**
@@ -366,6 +382,44 @@ function redactWechatPayloadForLogs(
         enabled: config?.redactWxidsInLogs !== false,
         exactMatches: config?.redactExtraWxids,
     });
+}
+
+function rewriteWechatNonOwnerAddressing(text: string, params: {
+    isMaster: boolean;
+    senderName?: string;
+}): string {
+    if (params.isMaster || typeof text !== "string" || !text.trim()) {
+        return text;
+    }
+
+    const fallbackName = "这位朋友";
+    const rawName = (params.senderName || "").trim();
+    const safeName =
+        rawName &&
+        rawName !== "User" &&
+        !/^wxid_/i.test(rawName) &&
+        !rawName.endsWith("@chatroom")
+            ? rawName
+            : fallbackName;
+
+    let rewritten = text;
+    rewritten = rewritten.replace(
+        /^\s*(?:Boss|boss|BOSS|主人|老板|老大)\s*([,，:：、-]\s*)?/,
+        `${safeName}，`,
+    );
+    rewritten = rewritten.replace(
+        /只有\s*(?:Boss|boss|BOSS|主人|老板|老大)(?:（[^）]*）)?/g,
+        "只有主人",
+    );
+    rewritten = rewritten.replace(
+        /请由\s*(?:Boss|boss|BOSS|主人|老板|老大)(?:（[^）]*）)?/g,
+        "请由主人",
+    );
+    rewritten = rewritten.replace(
+        /(?:Boss|boss|BOSS|主人|老板|老大)(?:（[^）]*）)?\s*才能/g,
+        "主人才能",
+    );
+    return rewritten;
 }
 
 function resolveWechatBareLocalMediaPath(params: {
@@ -2395,50 +2449,6 @@ function closeWebSocketServer(server: WebSocketServer): Promise<void> {
     });
 }
 
-function closeHttpServer(server: HttpServer): Promise<void> {
-    return new Promise((resolve) => {
-        let settled = false;
-        const finish = () => {
-            if (settled) return;
-            settled = true;
-            resolve();
-        };
-
-        try {
-            server.closeIdleConnections?.();
-        } catch { }
-        try {
-            server.closeAllConnections?.();
-        } catch { }
-
-        for (const socket of bridgeTcpSockets) {
-            try {
-                socket.destroy();
-            } catch { }
-        }
-        bridgeTcpSockets.clear();
-
-        try {
-            if (!server.listening) {
-                finish();
-                return;
-            }
-            server.close(() => finish());
-        } catch {
-            finish();
-            return;
-        }
-
-        const timeout = setTimeout(() => {
-            try {
-                server.closeAllConnections?.();
-            } catch { }
-            finish();
-        }, 1500);
-        timeout.unref?.();
-    });
-}
-
 async function closeBridgeResources(api?: OpenClawPluginApi, reason = "shutdown") {
     if (bridgeClosePromise) {
         return bridgeClosePromise;
@@ -2472,15 +2482,6 @@ async function closeBridgeResources(api?: OpenClawPluginApi, reason = "shutdown"
             await closeWebSocketServer(wsServer);
         }
 
-        const httpServer = bridgeHttpServer ?? state.httpServer ?? null;
-        bridgeHttpServer = null;
-        state.httpServer = null;
-        if (httpServer) {
-            await closeHttpServer(httpServer);
-        } else {
-            bridgeTcpSockets.clear();
-        }
-
         clearModuleRefs();
         clearBridgeRuntimeState();
         logBridgeState(api, `close:done:${reason}`, state);
@@ -2493,124 +2494,52 @@ async function closeBridgeResources(api?: OpenClawPluginApi, reason = "shutdown"
     return bridgeClosePromise;
 }
 
-function handleBridgeHttpRequest(api: OpenClawPluginApi, req: IncomingMessage, res: ServerResponse) {
-    if (req.url && req.url.startsWith("/media/")) {
-        const filePath = restoreServedFilePath(req.url.slice("/media/".length));
+function attachBridgeClientSocketHandlers(api: OpenClawPluginApi, socket: WebSocket) {
+    setActiveBridgeSocket(socket);
+    markBridgePong();
+
+    socket.on("message", async (raw) => {
         try {
-            const allowedRoots = resolveWechatMediaServeRoots(api.runtime.config.current(), api.logger);
-            if (!isPathWithinRoots(filePath, allowedRoots)) {
-                api.logger.warning?.(
-                    `[WeChat] /media forbidden: url=${req.url} filePath=${filePath} allowedRoots=${allowedRoots.join(" | ")}`,
-                );
-                res.statusCode = 403;
-                res.end("Forbidden");
+            const text = raw.toString();
+            const frame = JSON.parse(text);
+            const event = frame?.event;
+            if (event === "ping") {
+                markBridgePong();
+                socket.send(JSON.stringify(buildFrame("openclaw_to_bridge", "pong")));
                 return;
             }
-            if (!fs.existsSync(filePath)) {
-                api.logger.warning?.(
-                    `[WeChat] /media miss: url=${req.url} filePath=${filePath} exists=false allowedRoots=${allowedRoots.join(" | ")}`,
-                );
-                res.statusCode = 404;
-                res.end("File not found");
+            if (event === "pong") {
+                markBridgePong();
                 return;
             }
-            const stat = fs.statSync(filePath);
-            if (!stat.isFile()) {
-                res.statusCode = 400;
-                res.end("Not a file");
+            if (event === "inbound_message") {
+                await handleInboundMessage(api, frame?.payload || {});
                 return;
             }
-            const ext = path.extname(filePath).toLowerCase();
-            const mimeMap: Record<string, string> = {
-                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-                ".mp4": "video/mp4", ".mov": "video/quicktime", ".avi": "video/x-msvideo",
-                ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
-                ".pdf": "application/pdf", ".bin": "application/octet-stream",
-            };
-            res.setHeader("Content-Type", mimeMap[ext] || "application/octet-stream");
-            res.setHeader("Content-Length", stat.size);
-            fs.createReadStream(filePath).pipe(res);
         } catch (err: any) {
-            res.statusCode = 500;
-            res.end(`Error: ${err.message}`);
+            api.logger.error(`[WeChat] WS message error: ${err.message}`);
         }
-        return;
-    }
-
-    res.statusCode = 404;
-    res.end("Not Found");
-}
-
-function configureBridgeHttpServer(server: HttpServer) {
-    server.keepAliveTimeout = 1000;
-    server.headersTimeout = 5000;
-    server.on("connection", (socket: Socket) => {
-        bridgeTcpSockets.add(socket);
-        socket.on("close", () => {
-            bridgeTcpSockets.delete(socket);
-        });
     });
-}
 
-function attachBridgeSocketHandlers(api: OpenClawPluginApi, wsServer: WebSocketServer) {
-    wsServer.on("connection", (socket: WebSocket, req) => {
-        const oldSocket = getActiveBridgeSocket();
-        if (oldSocket && oldSocket.readyState === oldSocket.OPEN) {
-            api.logger.warn(`[WeChat] Bridge WS already connected, reject client from ${req.socket.remoteAddress}`);
-            socket.close(1013, "bridge already connected");
-            return;
+    socket.on("close", (code) => {
+        const state = getGlobalState();
+        if (getActiveBridgeSocket() === socket) {
+            setActiveBridgeSocket(null);
         }
-        setActiveBridgeSocket(socket);
-        markBridgePong();
-        api.logger.info(`[WeChat] Bridge WS connected from ${req.socket.remoteAddress}`);
+        state.clientConnecting = false;
+        api.logger.warn(`[WeChat] Bridge WS disconnected code=${code}`);
+        scheduleBridgeClientReconnect(api, "socket-close");
+    });
 
-        socket.on("message", async (raw) => {
-            try {
-                const text = raw.toString();
-                const frame = JSON.parse(text);
-                const event = frame?.event;
-                if (event === "ping") {
-                    markBridgePong();
-                    socket.send(JSON.stringify(buildFrame("openclaw_to_bridge", "pong")));
-                    return;
-                }
-                if (event === "pong") {
-                    markBridgePong();
-                    return;
-                }
-                if (event === "inbound_message") {
-                    await handleInboundMessage(api, frame?.payload || {});
-                    return;
-                }
-            } catch (err: any) {
-                api.logger.error(`[WeChat] WS message error: ${err.message}`);
-            }
-        });
-
-        socket.on("close", (code) => {
-            if (getActiveBridgeSocket() === socket) setActiveBridgeSocket(null);
-            api.logger.warn(`[WeChat] Bridge WS disconnected code=${code}`);
-        });
+    socket.on("error", (err: any) => {
+        api.logger.warn(`[WeChat] Bridge WS client error: ${err?.message || err}`);
     });
 }
 
-function createBridgeServers(api: OpenClawPluginApi, wsPath: string) {
-    const httpServer = createServer((req, res) => handleBridgeHttpRequest(api, req, res));
-    configureBridgeHttpServer(httpServer);
-
-    const wsServer = new WebSocketServer({
-        server: httpServer,
-        path: wsPath,
-    });
-    attachBridgeSocketHandlers(api, wsServer);
-
-    bridgeHttpServer = httpServer;
-    bridgeWss = wsServer;
-    setWechatWsServer(wsServer);
+function initializeBridgeClientState() {
+    bridgeWss = null;
+    setWechatWsServer(null);
     syncStateFromModuleRefs();
-
-    return { httpServer, wsServer };
 }
 
 type WechatBridgeWsConfig = {
@@ -2618,20 +2547,6 @@ type WechatBridgeWsConfig = {
     port: number;
     path: string;
 };
-
-function hasListeningBridgeServer(state = getGlobalState()): boolean {
-    return Boolean(
-        (bridgeWss && bridgeHttpServer?.listening) ||
-        (state.wsServer && state.httpServer?.listening),
-    );
-}
-
-function hasStaleBridgeObjects(state = getGlobalState()): boolean {
-    return Boolean(
-        (bridgeWss || state.wsServer || bridgeHttpServer || state.httpServer) &&
-        !hasListeningBridgeServer(state),
-    );
-}
 
 function installBridgeHeartbeat(api: OpenClawPluginApi, state = getGlobalState()) {
     if (bridgeHeartbeatTimer) {
@@ -2653,17 +2568,67 @@ function installBridgeHeartbeat(api: OpenClawPluginApi, state = getGlobalState()
     state.heartbeatTimer = bridgeHeartbeatTimer;
 }
 
-async function startBridgeHttpListening(api: OpenClawPluginApi, wsConfig: WechatBridgeWsConfig, options?: {
-    retry?: boolean;
-}) {
-    if (!bridgeHttpServer) {
-        throw new Error("bridge http server not initialized");
+function buildWechatBridgeServerUrl(wsConfig: WechatBridgeWsConfig): string {
+    return `ws://${wsConfig.host}:${wsConfig.port}${wsConfig.path}`;
+}
+
+function scheduleBridgeClientReconnect(api: OpenClawPluginApi, reason: string) {
+    if (bridgeClientReconnectTimer || bridgeClosePromise) {
+        return;
     }
-    await listenBridgeHttpServer(bridgeHttpServer, wsConfig.host, wsConfig.port);
-    api.logger.info(
-        `[WeChat] WS bridge listening at ws://${wsConfig.host}:${wsConfig.port}${wsConfig.path}` +
-        `${options?.retry ? " (retry success)" : ""}`,
-    );
+    api.logger.info(`[WeChat] Scheduling bridge reconnect (${reason})`);
+    bridgeClientReconnectTimer = setTimeout(() => {
+        bridgeClientReconnectTimer = null;
+        void ensureBridgeStarted(api).catch((err) => {
+            handleBridgeStartFailure(api, err);
+        });
+    }, 2000);
+}
+
+async function connectBridgeClient(api: OpenClawPluginApi, wsConfig: WechatBridgeWsConfig) {
+    const state = getGlobalState();
+    if (state.clientConnecting) {
+        return;
+    }
+    const activeSocket = getActiveBridgeSocket();
+    if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
+        return;
+    }
+
+    state.clientConnecting = true;
+    const targetUrl = buildWechatBridgeServerUrl(wsConfig);
+    await new Promise<void>((resolve, reject) => {
+        const socket = new WebSocket(targetUrl);
+        let settled = false;
+
+        const finishResolve = () => {
+            if (settled) return;
+            settled = true;
+            state.clientConnecting = false;
+            resolve();
+        };
+        const finishReject = (err: Error) => {
+            if (settled) return;
+            settled = true;
+            state.clientConnecting = false;
+            reject(err);
+        };
+
+        socket.once("open", () => {
+            attachBridgeClientSocketHandlers(api, socket);
+            finishResolve();
+        });
+        socket.once("error", (err: any) => {
+            try {
+                socket.close();
+            } catch { }
+            api.logger.warn(
+                `[WeChat] Bridge WS socket connect error to ${targetUrl}: `
+                + `${err instanceof Error ? err.message : String(err)}`,
+            );
+            finishReject(err instanceof Error ? err : new Error(String(err)));
+        });
+    });
 }
 
 function handleBridgeStartFailure(api: OpenClawPluginApi, err: unknown) {
@@ -2692,9 +2657,10 @@ async function ensureBridgeStarted(api: OpenClawPluginApi) {
             port: bridgeConfig.wsPort,
             path: bridgeConfig.wsPath,
         };
+        const targetUrl = buildWechatBridgeServerUrl(wsConfig);
 
         api.logger.debug(
-            `[WeChat] Bridge Config: host=${wsConfig.host}, port=${wsConfig.port}, path=${wsConfig.path}`,
+            `[WeChat] Bridge Config: wsHost=${wsConfig.host}, wsPort=${wsConfig.port}, wsPath=${wsConfig.path}`,
         );
         logBridgeState(api, "start:before-wait");
 
@@ -2707,54 +2673,10 @@ async function ensureBridgeStarted(api: OpenClawPluginApi) {
         const state = getGlobalState();
         syncModuleRefsFromState(state);
 
-        if (hasStaleBridgeObjects(state)) {
-            api.logger.warn("[WeChat] Found stale bridge objects during startup, cleaning them up first.");
-            logBridgeState(api, "start:stale-before-cleanup", state);
-            await closeBridgeResources(api, "startup stale cleanup");
-            syncModuleRefsFromState(state);
-            logBridgeState(api, "start:stale-after-cleanup", state);
-        }
+        initializeBridgeClientState();
+        logBridgeState(api, "start:client-ready", state);
 
-        if (hasListeningBridgeServer(state)) {
-            api.logger.debug("[WeChat] Reusing existing WS bridge server instance.");
-            syncModuleRefsFromState(state);
-            logBridgeState(api, "start:reuse-existing", state);
-            return;
-        }
-
-        createBridgeServers(api, wsConfig.path);
-        logBridgeState(api, "start:servers-created", state);
-
-        try {
-            await startBridgeHttpListening(api, wsConfig);
-            logBridgeState(api, "start:listening", state);
-        } catch (err: any) {
-            if (err?.code !== "EADDRINUSE") {
-                throw err;
-            }
-
-            api.logger.warn(
-                `[WeChat] Port ${wsConfig.port} is busy during startup, trying one delayed retry after cleanup.`,
-            );
-            logBridgeState(api, "start:eaddrinuse-before-cleanup", state);
-            await closeBridgeResources(api, "startup retry cleanup");
-            await sleep(1200);
-            createBridgeServers(api, wsConfig.path);
-            logBridgeState(api, "start:retry-servers-created", state);
-
-            try {
-                await startBridgeHttpListening(api, wsConfig, { retry: true });
-                logBridgeState(api, "start:retry-listening", state);
-            } catch (retryErr: any) {
-                api.logger.warn(
-                    `[WeChat] CRITICAL: Port ${wsConfig.port} is still busy after retry. Another process is likely holding it.`,
-                );
-                logBridgeState(api, "start:retry-failed", state);
-                await closeBridgeResources(api, "startup retry failed");
-                return;
-            }
-        }
-
+        await connectBridgeClient(api, wsConfig);
         installBridgeHeartbeat(api, state);
         syncStateFromModuleRefs(state);
         logBridgeState(api, "start:heartbeat-ready", state);
@@ -2884,20 +2806,6 @@ function maybeTriggerWechatBridgeStart(api: OpenClawPluginApi, reason: string): 
     );
     triggerBridgeStart(api);
     return true;
-}
-
-async function listenBridgeHttpServer(server: HttpServer, host: string, port: number) {
-    await new Promise<void>((resolve, reject) => {
-        const onError = (err: Error) => {
-            server.off("error", onError);
-            reject(err);
-        };
-        server.once("error", onError);
-        server.listen(port, host, () => {
-            server.off("error", onError);
-            resolve();
-        });
-    });
 }
 
 /**
@@ -3068,6 +2976,12 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         OwnerAllowFrom: isMaster ? [resolvedSenderId] : undefined,
         isMaster,
         IsMaster: isMaster,
+        senderIsOwner: isMaster,
+        SenderIsOwner: isMaster,
+        WeChatSenderRole: isMaster ? "owner" : "non-owner",
+        WeChatAddressingInstruction: isMaster
+            ? "This WeChat sender is the owner. Owner-style address terms are allowed."
+            : "This WeChat sender is not the owner. Do not address this sender as Boss, boss, 主人, 老板, or 老大; use their senderName or a neutral address instead.",
         messageId,
         originalMsgId: upstreamMessageTraceId,
         OriginalMsgId: upstreamMessageTraceId,
@@ -3468,7 +3382,19 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                     text: newText,
                     workspaceBase: bridgeConfig.workspaceBase,
                 });
-                let textToProcess = extractedBareMedia.text;
+                let textToProcess = rewriteWechatNonOwnerAddressing(extractedBareMedia.text, {
+                    isMaster,
+                    senderName: resolvedSenderName,
+                });
+                if (sentMediaKeys.size > 0 && textToProcess) {
+                    const sanitizedText = stripFalseWechatMediaFailureSuffix(textToProcess);
+                    if (sanitizedText.stripped) {
+                        api.logger.info(
+                            `[WeChat] Suppressed false media failure suffix after successful media send stage=${info.kind}`,
+                        );
+                        textToProcess = sanitizedText.text;
+                    }
+                }
                 
                 // [Crucial Check] If we already sent this exact line, skip it
                 // Normalize whitespace before comparison to catch block vs final formatting differences
@@ -3668,28 +3594,35 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
     // This handles the scenario where OpenClaw core dispatches media via direct
     // sendMedia calls (e.g. during tool execution) but does not route the final
     // text reply through the deliver callback.
-    const unseenText = turnTextSeen.trim();
-    if (!cumulativeSentText && unseenText && wechatPlugin.outbound?.sendText) {
+    const unseenText = rewriteWechatNonOwnerAddressing(turnTextSeen.trim(), {
+        isMaster,
+        senderName: resolvedSenderName,
+    });
+    const finalUnseenText =
+        sentMediaKeys.size > 0 && unseenText
+            ? stripFalseWechatMediaFailureSuffix(unseenText).text
+            : unseenText;
+    if (!cumulativeSentText && finalUnseenText && wechatPlugin.outbound?.sendText) {
         const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
-        const internalCheck = isWechatInternalStatusReply(unseenText);
-        const hasNoReply = unseenText.toUpperCase().includes("NO_REPLY");
+        const internalCheck = isWechatInternalStatusReply(finalUnseenText);
+        const hasNoReply = finalUnseenText.toUpperCase().includes("NO_REPLY");
         const blockedReply = typeof sessionKey === "string"
             ? getWechatBlockedReplyForSession(sessionKey)
             : undefined;
         if (!internalCheck.matched && !hasNoReply) {
             api.logger.info(
                 `[WeChat] Fallback: deliver never sent text but onPartialReply captured content, sending now ` +
-                `session=${sessionKey} textLen=${unseenText.length} text="${summarizeWechatTextForLog(unseenText, 120)}"`,
+                `session=${sessionKey} textLen=${finalUnseenText.length} text="${summarizeWechatTextForLog(finalUnseenText, 120)}"`,
             );
             await wechatPlugin.outbound.sendText({
                 to: from,
-                text: unseenText,
+                text: finalUnseenText,
                 msg_id: messageId,
                 original_msg_id: upstreamMessageTraceId,
                 accountId: accountId || "default",
                 cfg,
             } as any);
-            cumulativeSentText = unseenText;
+            cumulativeSentText = finalUnseenText;
         }
     }
 
@@ -3739,7 +3672,7 @@ const plugin = {
                     );
                 }
 
-                if (!sharedState.closing && !sharedState.startPromise && !hasListeningBridgeServer(sharedState)) {
+                if (!sharedState.closing && !sharedState.startPromise && !hasActiveBridgeClient(sharedState)) {
                     const now = Date.now();
                     const shouldAttemptRecovery =
                         !sharedState.lastRecoveryAttemptAt ||

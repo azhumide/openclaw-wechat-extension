@@ -1,0 +1,32 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ExpandThis = ExpandThis;exports.FromType = FromType;
+var _array = require("../../types/array.mjs");
+var _async_iterator = require("../../types/async_iterator.mjs");
+var _constructor = require("../../types/constructor.mjs");
+var _function = require("../../types/function.mjs");
+var _iterator = require("../../types/iterator.mjs");
+var _intersect = require("../../types/intersect.mjs");
+var _object = require("../../types/object.mjs");
+var _promise = require("../../types/promise.mjs");
+var _tuple = require("../../types/tuple.mjs");
+var _this = require("../../types/this.mjs");
+var _union = require("../../types/union.mjs"); // deno-fmt-ignore-file
+function FromTypes(properties, types) {
+  return types.map((type) => FromType(properties, type));
+}
+function FromType(properties, type) {
+  return (0, _array.IsArray)(type) ? (0, _array._Array_)(FromType(properties, type.items)) :
+  (0, _async_iterator.IsAsyncIterator)(type) ? (0, _async_iterator.AsyncIterator)(FromType(properties, type.iteratorItems)) :
+  (0, _constructor.IsConstructor)(type) ? (0, _constructor.Constructor)(FromTypes(properties, type.parameters), FromType(properties, type.instanceType)) :
+  (0, _function.IsFunction)(type) ? (0, _function._Function_)(FromTypes(properties, type.parameters), FromType(properties, type.returnType)) :
+  (0, _iterator.IsIterator)(type) ? (0, _iterator.Iterator)(FromType(properties, type.iteratorItems)) :
+  (0, _promise.IsPromise)(type) ? (0, _promise.Promise)(FromType(properties, type.item)) :
+  (0, _tuple.IsTuple)(type) ? (0, _tuple.Tuple)(FromTypes(properties, type.items)) :
+  (0, _union.IsUnion)(type) ? (0, _union.Union)(FromTypes(properties, type.anyOf)) :
+  (0, _intersect.IsIntersect)(type) ? (0, _intersect.Intersect)(FromTypes(properties, type.allOf)) :
+  (0, _this.IsThis)(type) ? (0, _object._Object_)(properties) :
+  type;
+}
+function ExpandThis(properties, type) {
+  const result = FromType(properties, type);
+  return result;
+} /* v9-8e275857efd0f6b4 */

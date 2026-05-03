@@ -1,0 +1,6 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.default = exports.NativeGuard = exports.Guard = exports.GlobalsGuard = exports.EmitGuard = void 0;var _EmitGuard = _interopRequireWildcard(require("./emit.mjs"));exports.EmitGuard = _EmitGuard;var _GlobalsGuard = _interopRequireWildcard(require("./globals.mjs"));exports.GlobalsGuard = _GlobalsGuard;var _NativeGuard = _interopRequireWildcard(require("./native.mjs"));exports.NativeGuard = _NativeGuard;
+
+
+var Guard = _interopRequireWildcard(require("./guard.mjs"));var _Guard = Guard;exports.Guard = Guard;function _interopRequireWildcard(e, t) {if ("function" == typeof WeakMap) var r = new WeakMap(),n = new WeakMap();return (_interopRequireWildcard = function (e, t) {if (!t && e && e.__esModule) return e;var o,i,f = { __proto__: null, default: e };if (null === e || "object" != typeof e && "function" != typeof e) return f;if (o = t ? n : r) {if (o.has(e)) return o.get(e);o.set(e, f);}for (const t in e) "default" !== t && {}.hasOwnProperty.call(e, t) && ((i = (o = Object.defineProperty) && Object.getOwnPropertyDescriptor(e, t)) && (i.get || i.set) ? o(f, t, i) : f[t] = e[t]);return f;})(e, t);}var _default = exports.default =
+
+Guard; /* v9-5924ce79c60cc693 */

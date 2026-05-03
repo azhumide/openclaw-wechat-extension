@@ -1,5 +1,5 @@
 {
-  "wsHost": "0.0.0.0",
+  "wsHost": "10.10.10.80",
   "wsPort": 9093,
   "wsPath": "/ws",
   "bridgeDownloadHost": "10.10.10.80",
@@ -13,14 +13,26 @@
     "xdoufux"
   ],
   "nonOwnerToolAuthMode": "deny",
-  "nonOwnerToolAuthTools": ["exec", "write"],
+  "nonOwnerToolAuthTools": [
+    "exec",
+    "write"
+  ],
   "toolAuthBypassWxids": [
     "wxid_9uwska6u4yzm22"
   ],
   "toolAuthBypassByTool": {
-    "process": ["xdoufux"]
+    "process": [
+      "xdoufux"
+    ]
   },
-  "toolAuthBlockedSkills": ["gog", "gws-gmail", "didi-ride-skill", "kdocs", "626-rotator-skill", "gitlab-helper"],
+  "toolAuthBlockedSkills": [
+    "gog",
+    "gws-gmail",
+    "didi-ride-skill",
+    "kdocs",
+    "626-rotator-skill",
+    "gitlab-helper"
+  ],
   "toolAuthAllowInstalledSkills": true,
   "toolAuthDebugInstalledSkills": true,
   "ownerExecBypassApproval": true,

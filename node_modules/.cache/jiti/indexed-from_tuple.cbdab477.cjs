@@ -1,0 +1,35 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.FromTuple = FromTuple;
+
+var _index = require("../../../guard/index.mjs");
+var _literal = require("../../types/literal.mjs");
+var _number = require("../../types/number.mjs");
+var _integer = require("../../types/integer.mjs");
+var _evaluate = require("../evaluate/evaluate.mjs");
+var _index2 = require("../../extends/index.mjs");
+var _array_indexer = require("./array_indexer.mjs"); // deno-lint-ignore-file ban-types
+// deno-fmt-ignore-file
+function IndexElementsWithIndexer(types, indexer) {return types.reduceRight((result, right, index) => {
+    const check = (0, _index2.Extends)({}, (0, _literal.Literal)(index), indexer);
+    return _index2.ExtendsResult.IsExtendsTrueLike(check) ?
+    [right, ...result] :
+    result;
+  }, []);
+}
+function FromTupleWithIndexer(types, indexer) {
+  const formattedArrayIndexer = (0, _array_indexer.FormatArrayIndexer)(indexer);
+  const elements = IndexElementsWithIndexer(types, formattedArrayIndexer);
+  return (0, _evaluate.EvaluateUnionFast)(elements);
+}
+function FromTupleWithoutIndexer(types) {
+  return (0, _evaluate.EvaluateUnionFast)(types);
+}
+function FromTuple(types, indexer) {
+  return (
+    // length (intrinsic)
+    (0, _literal.IsLiteral)(indexer) && _index.Guard.IsEqual(indexer.const, 'length') ?
+    (0, _literal.Literal)(types.length)
+    // indexer
+    : (0, _number.IsNumber)(indexer) || (0, _integer.IsInteger)(indexer) ?
+    FromTupleWithoutIndexer(types) :
+    FromTupleWithIndexer(types, indexer));
+} /* v9-c98e2d498da2fdea */

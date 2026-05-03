@@ -13,23 +13,23 @@
         "properties": {
           "wsHost": {
             "type": "string",
-            "description": "WS bridge bind host, default 0.0.0.0"
+            "description": "OpenClawBridge WS server host, default 127.0.0.1"
           },
           "wsPort": {
             "type": "number",
-            "description": "WS bridge bind port, default 9093"
+            "description": "OpenClawBridge WS server port, default 9093"
           },
           "wsPath": {
             "type": "string",
-            "description": "WS bridge path, default /ws"
+            "description": "OpenClawBridge WS server path, default /ws"
           },
           "bridgeDownloadHost": {
             "type": "string",
-            "description": "Bridge HTTP download host/IP, default 127.0.0.1"
+            "description": "Legacy media-download host/IP hint. Usually keep it aligned with wsHost in single-port mode."
           },
           "bridgeDownloadBaseUrl": {
             "type": "string",
-            "description": "Full public base URL for bridge downloads, e.g. https://example.com"
+            "description": "Legacy public base URL for media-download fallback. Usually leave empty in single-port mode."
           },
           "workspaceBase": {
             "type": "string",
@@ -84,23 +84,23 @@
     "properties": {
       "wsHost": {
         "type": "string",
-        "description": "WS bridge bind host, default 0.0.0.0"
+        "description": "OpenClawBridge WS server host, default 127.0.0.1"
       },
       "wsPort": {
         "type": "number",
-        "description": "WS bridge bind port, default 9093"
+        "description": "OpenClawBridge WS server port, default 9093"
       },
       "wsPath": {
         "type": "string",
-        "description": "WS bridge path, default /ws"
+        "description": "OpenClawBridge WS server path, default /ws"
       },
       "bridgeDownloadHost": {
         "type": "string",
-        "description": "Bridge HTTP download host/IP, default 127.0.0.1"
+        "description": "Legacy media-download host/IP hint. Usually keep it aligned with wsHost in single-port mode."
       },
       "bridgeDownloadBaseUrl": {
         "type": "string",
-        "description": "Full public base URL for bridge downloads, e.g. https://example.com"
+        "description": "Legacy public base URL for media-download fallback. Usually leave empty in single-port mode."
       },
       "workspaceBase": {
         "type": "string",

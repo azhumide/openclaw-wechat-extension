@@ -176,9 +176,9 @@ export const wechatPlugin: ChannelPlugin<any> = {
         schema: {
             type: "object",
             properties: {
-                wsHost: { type: "string", description: "Bridge WS server host" },
-                wsPort: { type: "number", description: "Bridge WS server port" },
-                wsPath: { type: "string", description: "Bridge WS path" },
+                wsHost: { type: "string", description: "OpenClawBridge WS server host" },
+                wsPort: { type: "number", description: "OpenClawBridge WS server port" },
+                wsPath: { type: "string", description: "OpenClawBridge WS path" },
                 bridgeDownloadHost: { type: "string", description: "Bridge HTTP download host/IP for remote media access" },
                 bridgeDownloadBaseUrl: { type: "string", description: "Full public base URL for bridge downloads, e.g. https://example.com" },
                 workspaceBase: { type: "string", description: "Workspace base path used for temp/download files" },
@@ -284,7 +284,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
     },
     gateway: {
         startAccount: async (ctx) => {
-            ctx.log?.info(`WeChat channel ${ctx.accountId} started. Waiting for WS bridge.`);
+            ctx.log?.info(`WeChat channel ${ctx.accountId} 已启动，等待桥接连接。`);
             while (!ctx.abortSignal.aborted) {
                 await new Promise((r) => setTimeout(r, 1000));
             }

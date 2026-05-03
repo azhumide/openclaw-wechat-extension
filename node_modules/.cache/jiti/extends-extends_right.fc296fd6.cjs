@@ -1,0 +1,44 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ExtendsRight = ExtendsRight;
+var _index = require("../../guard/index.mjs");
+var _index2 = require("../../system/memory/index.mjs");
+var _any = require("../types/any.mjs");
+var _enum = require("../types/enum.mjs");
+var _infer = require("../types/infer.mjs");
+var _intersect = require("../types/intersect.mjs");
+var _template_literal = require("../types/template_literal.mjs");
+var _union = require("../types/union.mjs");
+var _unknown = require("../types/unknown.mjs");
+var _extends_left = require("./extends_left.mjs");
+var Result = _interopRequireWildcard(require("./result.mjs"));
+var _decode = require("../engine/template_literal/decode.mjs");
+var _index3 = require("../engine/enum/index.mjs");function _interopRequireWildcard(e, t) {if ("function" == typeof WeakMap) var r = new WeakMap(),n = new WeakMap();return (_interopRequireWildcard = function (e, t) {if (!t && e && e.__esModule) return e;var o,i,f = { __proto__: null, default: e };if (null === e || "object" != typeof e && "function" != typeof e) return f;if (o = t ? n : r) {if (o.has(e)) return o.get(e);o.set(e, f);}for (const t in e) "default" !== t && {}.hasOwnProperty.call(e, t) && ((i = (o = Object.defineProperty) && Object.getOwnPropertyDescriptor(e, t)) && (i.get || i.set) ? o(f, t, i) : f[t] = e[t]);return f;})(e, t);} // deno-fmt-ignore-file
+function ExtendsRightInfer(inferred, name, left, right) {
+  return Result.Match((0, _extends_left.ExtendsLeft)(inferred, left, right), (checkInferred) => Result.ExtendsTrue(_index2.Memory.Assign(_index2.Memory.Assign(inferred, checkInferred), { [name]: left })), () => Result.ExtendsFalse());
+}
+function ExtendsRightAny(inferred, _left) {
+  return Result.ExtendsTrue(inferred);
+}
+function ExtendsRightEnum(inferred, left, right) {
+  const union = (0, _index3.EnumValuesToUnion)(right);
+  return (0, _extends_left.ExtendsLeft)(inferred, left, union);
+}
+function ExtendsRightIntersect(inferred, left, right) {
+  return _index.Guard.TakeLeft(right, (head, tail) => Result.Match((0, _extends_left.ExtendsLeft)(inferred, left, head), (inferred) => ExtendsRightIntersect(inferred, left, tail), () => Result.ExtendsFalse()), () => Result.ExtendsTrue(inferred));
+}
+function ExtendsRightTemplateLiteral(inferred, left, right) {
+  const decoded = (0, _decode.TemplateLiteralDecode)(right);
+  return (0, _extends_left.ExtendsLeft)(inferred, left, decoded);
+}
+function ExtendsRightUnion(inferred, left, right) {
+  return _index.Guard.TakeLeft(right, (head, tail) => Result.Match((0, _extends_left.ExtendsLeft)(inferred, left, head), (inferred) => Result.ExtendsTrue(inferred), () => ExtendsRightUnion(inferred, left, tail)), () => Result.ExtendsFalse());
+}
+function ExtendsRight(inferred, left, right) {
+  return (0, _any.IsAny)(right) ? ExtendsRightAny(inferred, left) :
+  (0, _enum.IsEnum)(right) ? ExtendsRightEnum(inferred, left, right.enum) :
+  (0, _infer.IsInfer)(right) ? ExtendsRightInfer(inferred, right.name, left, right.extends) :
+  (0, _intersect.IsIntersect)(right) ? ExtendsRightIntersect(inferred, left, right.allOf) :
+  (0, _template_literal.IsTemplateLiteral)(right) ? ExtendsRightTemplateLiteral(inferred, left, right.pattern) :
+  (0, _union.IsUnion)(right) ? ExtendsRightUnion(inferred, left, right.anyOf) :
+  (0, _unknown.IsUnknown)(right) ? Result.ExtendsTrue(inferred) :
+  Result.ExtendsFalse();
+} /* v9-4aa86bc2ed986b9d */

@@ -1,0 +1,19 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.FromUnion = FromUnion;
+var _index = require("../../../guard/index.mjs");
+var _index2 = require("../../../system/unreachable/index.mjs");
+var _evaluate = require("../evaluate/evaluate.mjs");
+var _from_type = require("./from_type.mjs"); // deno-fmt-ignore-file
+function CollapseUnionProperties(left, right) {
+  const sharedKeys = _index.Guard.Keys(left).filter((key) => key in right);
+  const result = sharedKeys.reduce((result, key) => {
+    return { ...result, [key]: (0, _evaluate.EvaluateUnion)([left[key], right[key]]) };
+  }, {});
+  return result;
+}
+function ReduceVariants(types, result) {
+  return _index.Guard.TakeLeft(types, (left, right) => ReduceVariants(right, CollapseUnionProperties(result, (0, _from_type.FromType)(left))), () => result);
+}
+function FromUnion(types) {
+  return _index.Guard.TakeLeft(types, (left, right) => ReduceVariants(right, (0, _from_type.FromType)(left)), () => (0, _index2.Unreachable)());
+}
+// deno-coverage-ignore-stop /* v9-d66beae61508bd03 */

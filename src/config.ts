@@ -218,7 +218,7 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
     const root = cfg?.channels?.wechat || {};
     const local = loadWechatLocalConfig(logger);
 
-    const wsHost = normalizeString(root.wsHost) || local.wsHost || "0.0.0.0";
+    const wsHost = normalizeString(root.wsHost) || local.wsHost || "127.0.0.1";
     const wsPort = normalizePort(root.wsPort) || local.wsPort || 9093;
     const wsPath = normalizeWsPath(root.wsPath) || local.wsPath || "/ws";
     const bridgeDownloadHost =

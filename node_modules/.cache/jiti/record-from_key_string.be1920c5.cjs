@@ -1,0 +1,12 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.FromStringKey = FromStringKey;
+var _index = require("../../../guard/index.mjs");
+var _record = require("../../types/record.mjs");
+var _record_create = require("./record_create.mjs"); // deno-fmt-ignore-file
+function FromStringKey(key, value) {
+  // special case: override for string with raw pattern. We do not observe inference for the
+  // raw string patterns, but as a pattern (assuming non-never) is in the set of string, we
+  // allow overriding. Callers will need to narrow to the pattern manually. TB legacy.
+  return _index.Guard.HasPropertyKey(key, 'pattern') && (_index.Guard.IsString(key.pattern) || key.pattern instanceof RegExp) ?
+  (0, _record_create.CreateRecord)(key.pattern.toString(), value) :
+  (0, _record_create.CreateRecord)(_record.StringKey, value);
+} /* v9-47edb006ea4fd149 */

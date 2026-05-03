@@ -1,0 +1,34 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.MappedVariants = MappedVariants;
+var _index = require("../../../guard/index.mjs");
+var _literal = require("../../types/literal.mjs");
+var _enum = require("../../types/enum.mjs");
+var _template_literal = require("../../types/template_literal.mjs");
+var _union = require("../../types/union.mjs");
+var _index2 = require("../enum/index.mjs");
+var _decode = require("../template_literal/decode.mjs"); // deno-fmt-ignore-file
+function FromTemplateLiteral(pattern) {
+  const decoded = (0, _decode.TemplateLiteralDecode)(pattern);
+  const result = FromType(decoded);
+  return result;
+}
+function FromUnion(types) {
+  return types.reduce((result, left) => {
+    return [...result, ...FromType(left)];
+  }, []);
+}
+function FromLiteral(value) {
+  const result = _index.Guard.IsNumber(value) ? [(0, _literal.Literal)(`${value}`)] : [(0, _literal.Literal)(value)];
+  return result;
+}
+function FromType(type) {
+  const result = (0, _enum.IsEnum)(type) ? FromUnion((0, _index2.EnumValuesToVariants)(type.enum)) :
+  (0, _literal.IsLiteral)(type) ? FromLiteral(type.const) :
+  (0, _template_literal.IsTemplateLiteral)(type) ? FromTemplateLiteral(type.pattern) :
+  (0, _union.IsUnion)(type) ? FromUnion(type.anyOf) :
+  [type];
+  return result;
+}
+function MappedVariants(type) {
+  const result = FromType(type);
+  return result;
+} /* v9-388c4c69ee8d8a39 */
