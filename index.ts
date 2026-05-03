@@ -2616,6 +2616,7 @@ async function connectBridgeClient(api: OpenClawPluginApi, wsConfig: WechatBridg
 
         socket.once("open", () => {
             attachBridgeClientSocketHandlers(api, socket);
+            api.logger.info(`[WeChat] Bridge WS connected: ${targetUrl}`);
             finishResolve();
         });
         socket.once("error", (err: any) => {
@@ -2639,6 +2640,9 @@ function handleBridgeStartFailure(api: OpenClawPluginApi, err: unknown) {
     api.logger.error(
         `[WeChat] Bridge start failure: ${err instanceof Error ? err.message : String(err)}`,
     );
+    if (!state.closing) {
+        scheduleBridgeClientReconnect(api, "start-failure");
+    }
 }
 
 async function ensureBridgeStarted(api: OpenClawPluginApi) {
@@ -2788,8 +2792,8 @@ function resolveWechatBridgeAutostartDecision(): {
     }
 
     return {
-        shouldStart: false,
-        reason: "non-service-process",
+        shouldStart: true,
+        reason: "default-on",
     };
 }
 

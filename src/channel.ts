@@ -284,7 +284,11 @@ export const wechatPlugin: ChannelPlugin<any> = {
     },
     gateway: {
         startAccount: async (ctx) => {
-            ctx.log?.info(`WeChat channel ${ctx.accountId} 已启动，等待桥接连接。`);
+            if (isBridgeConnected()) {
+                ctx.log?.info(`WeChat channel ${ctx.accountId} 已启动，桥接已连接。`);
+            } else {
+                ctx.log?.info(`WeChat channel ${ctx.accountId} 已启动，等待桥接连接。`);
+            }
             while (!ctx.abortSignal.aborted) {
                 await new Promise((r) => setTimeout(r, 1000));
             }
