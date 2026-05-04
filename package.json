@@ -1,22 +1,17 @@
 {
-  "name": "@openclaw/wechat",
-  "version": "1.0.0",
-  "description": "OpenClaw WeChat channel plugin",
-  "type": "module",
-  "dependencies": {
-    "ws": "^8.18.3"
-  },
-  "openclaw": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
-  "repository": "https://github.com/azhumide/openclaw-wechat-extension",
-  "keywords": [
-    "openclaw",
-    "wechat",
-    "plugin"
-  ],
-  "author": "azhumide",
-  "license": "MIT"
+    "name": "@openclaw/wechat",
+    "version": "1.0.0",
+    "description": "OpenClaw WeChat channel plugin",
+    "type": "module",
+    "scripts": {
+        "build": "npx esbuild index.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outdir=dist"
+    },
+    "dependencies": {
+        "ws": "^8.18.3"
+    },
+    "openclaw": {
+        "extensions": [
+            "./index.ts"
+        ]
+    }
 }
