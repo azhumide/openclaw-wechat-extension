@@ -2,10 +2,8 @@
 
 ## [v1.2.0] - 2026-05-06
 
-### 新增功能
-- **卡片转发增强**：优化了微信扩展对 AppMsg (卡片消息) 的处理逻辑，提升了在复杂任务场景下的发送成功率。
-- **构建忽略**：增加了 `.gitignore` 文件，规范了项目结构，移除了 `node_modules` 缓存对版本库的影响。
-
-### 优化
-- **依赖更新**：更新了核心依赖，提升了在高负载情况下的稳定性。
-- **错误处理**：改进了发送失败时的自动重试机制。
+### 变更
+- **项目清理**：引入 `.gitignore`，移除 `node_modules` 缓存对版本库的污染。
+- **构建脚本**：在 `package.json` 中新增 `build` 脚本，支持使用 `esbuild` 进行 ESM 格式构建。
+- **内部依赖重构**：更新了 `plugin-sdk-core` 和 `plugin-sdk-channel-actions` 的内部引用路径（从 `Rq2JD8YM` 等旧指纹迁移至 `6xoeEgQi` 等新指纹），确保与最新的 OpenClaw SDK 环境兼容。
+- **配置规范化**：移除了 `package.json` 中冗余的 `repository` 和 `keywords` 字段，使配置更符合 Extension 标准。
