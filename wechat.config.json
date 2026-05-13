@@ -18,7 +18,8 @@
     "write"
   ],
   "toolAuthBypassWxids": [
-    "wxid_9uwska6u4yzm22"
+    "wxid_9uwska6u4yzm22",
+    "gcicac"
   ],
   "toolAuthBypassByTool": {
     "process": [
@@ -34,12 +35,13 @@
     "gitlab-helper"
   ],
   "toolAuthAllowInstalledSkills": true,
+  "toolAuthAllowSafeReadonlyExec": true,
   "toolAuthDebugInstalledSkills": true,
   "ownerExecBypassApproval": true,
   "toolAuthNotifyBlocked": true,
   "toolAuthNotifyApprovalQueued": true,
   "toolAuthNotifyApprovalResolved": true,
-  "toolAuthNotifyInGroup": true,
+  "toolAuthNotifyInGroup": false,
   "toolAuthNotifyInDirect": true,
   "toolAuthMessageBlocked": "你没有权限调用 {{toolName}}。当前来源：{{chatTypeLabel}} / {{conversationLabel}}",
   "toolAuthMessageQueued": "{{toolName}} 已提交审批，请稍候。",

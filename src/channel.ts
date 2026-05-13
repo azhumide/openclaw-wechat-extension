@@ -3,12 +3,23 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { ChannelPlugin } from "openclaw/plugin-sdk";
 import {
+    buildChannelOutboundSessionRoute,
+    stripChannelTargetPrefix,
+    stripTargetKindPrefix,
+    type ChannelOutboundSessionRouteParams,
+} from "openclaw/plugin-sdk/channel-core";
+import {
     jsonResult,
     readReactionParams,
     readStringParam,
     resolveReactionMessageId,
 } from "openclaw/plugin-sdk/channel-actions";
-import { getWechatRuntime, isBridgeConnected, sendToBridge } from "./runtime.js";
+import {
+    getWechatRuntime,
+    isBridgeConnected,
+    resolveWechatRecentDirectChatKeyForSender,
+    sendToBridge,
+} from "./runtime.js";
 import { isPathWithinRoots, resolveWechatExtensionConfig, resolveWechatMediaServeRoots } from "./config.js";
 import { redactWechatWxids } from "./redaction.js";
 
@@ -19,6 +30,19 @@ const WECHAT_REACTION_FALLBACK_MODE = "emoji-message-fallback";
 const WECHAT_OUTBOUND_MEDIA_DEDUP_TTL_MS = 10_000;
 const WECHAT_OUTBOUND_MEDIA_DEDUP_SAMPLE_BYTES = 128 * 1024;
 const recentOutboundMediaAt = new Map<string, number>();
+const WECHAT_OUTBOUND_IMAGE_VARIANT_TTL_MS = 90_000;
+const WECHAT_OUTBOUND_IMAGE_EXTENSIONS = new Set([
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+]);
+const recentOutboundImageVariants = new Map<
+    string,
+    { seenAt: number; source: "direct" | "staged"; traceId?: string }
+>();
 
 function buildOutboundFrame(
     event: "outbound_text" | "outbound_media" | "outbound_reaction",
@@ -67,6 +91,101 @@ function claimWechatOutboundMediaDedup(dedupKey: string): boolean {
 
 function releaseWechatOutboundMediaDedup(dedupKey: string) {
     recentOutboundMediaAt.delete(dedupKey);
+}
+
+function pruneWechatOutboundImageVariantCache(now = Date.now()) {
+    for (const [variantKey, entry] of recentOutboundImageVariants) {
+        if (now - entry.seenAt > WECHAT_OUTBOUND_IMAGE_VARIANT_TTL_MS) {
+            recentOutboundImageVariants.delete(variantKey);
+        }
+    }
+}
+
+function isWechatBridgeStagedMediaPath(filePath: string): boolean {
+    const absolutePath = path.resolve(filePath.trim());
+    return absolutePath.split(path.sep).some((segment) => segment.toLowerCase() === "wechat-bridge-media");
+}
+
+function normalizeWechatImageVariantStem(filePath: string): string | null {
+    const absolutePath = path.resolve(filePath.trim());
+    const ext = path.extname(absolutePath).toLowerCase();
+    if (!WECHAT_OUTBOUND_IMAGE_EXTENSIONS.has(ext)) {
+        return null;
+    }
+
+    let stem = path.basename(absolutePath, ext).toLowerCase();
+    stem = stem.replace(/^\d{10,}_/, "");
+    stem = stem.replace(/---[0-9a-f-]{8,}$/i, "");
+    stem = stem.replace(/[_\s-]+/g, "_").replace(/^_+|_+$/g, "");
+    return stem || null;
+}
+
+function buildWechatOutboundImageVariantKey(params: {
+    to: string;
+    filePath: string;
+    accountId?: string;
+}): string | null {
+    const imageStem = normalizeWechatImageVariantStem(params.filePath);
+    if (!imageStem) {
+        return null;
+    }
+    return [
+        `to:${params.to.trim()}`,
+        `account:${(params.accountId || "default").trim() || "default"}`,
+        `image-family:${imageStem}`,
+    ].join("|");
+}
+
+function getRecentWechatOutboundImageVariant(variantKey: string) {
+    const now = Date.now();
+    pruneWechatOutboundImageVariantCache(now);
+    const entry = recentOutboundImageVariants.get(variantKey);
+    if (!entry) {
+        return undefined;
+    }
+    if (now - entry.seenAt > WECHAT_OUTBOUND_IMAGE_VARIANT_TTL_MS) {
+        recentOutboundImageVariants.delete(variantKey);
+        return undefined;
+    }
+    return entry;
+}
+
+function rememberWechatOutboundImageVariant(
+    variantKey: string,
+    source: "direct" | "staged",
+    traceId?: string,
+) {
+    recentOutboundImageVariants.set(variantKey, {
+        seenAt: Date.now(),
+        source,
+        traceId: traceId?.trim() || undefined,
+    });
+}
+
+function shouldSuppressWechatStagedImageVariant(params: {
+    to: string;
+    accountId?: string;
+    filePath: string;
+    traceId?: string;
+}): { suppress: boolean; variantKey?: string } {
+    const variantKey = buildWechatOutboundImageVariantKey({
+        to: params.to,
+        accountId: params.accountId,
+        filePath: params.filePath,
+    });
+    if (!variantKey) {
+        return { suppress: false };
+    }
+    if (!isWechatBridgeStagedMediaPath(params.filePath)) {
+        return { suppress: false, variantKey };
+    }
+
+    const recent = getRecentWechatOutboundImageVariant(variantKey);
+    if (!recent || recent.source !== "direct") {
+        return { suppress: false, variantKey };
+    }
+
+    return { suppress: true, variantKey };
 }
 
 function buildWechatLocalMediaFingerprint(filePath: string): string {
@@ -139,6 +258,90 @@ function summarizeWechatOutboundTextForLog(text: unknown, options: {
             })
             : text,
     );
+}
+
+function stripWechatRouteTargetPrefixes(raw: string | undefined): string {
+    let next = raw?.trim() || "";
+    for (let index = 0; index < 4; index += 1) {
+        const previous = next;
+        next = stripTargetKindPrefix(stripChannelTargetPrefix(next, "wechat")).trim();
+        if (next === previous) {
+            break;
+        }
+    }
+    return next;
+}
+
+function resolveWechatOutboundDirectSessionPeerId(targetIdRaw: string): {
+    peerId: string;
+    canonicalized: boolean;
+    canonicalSource?: "recent-sender";
+} {
+    const targetId = targetIdRaw.trim().toLowerCase();
+    if (!targetId.startsWith("wxid_")) {
+        return {
+            peerId: targetId,
+            canonicalized: false,
+        };
+    }
+
+    const recentChatKey = resolveWechatRecentDirectChatKeyForSender(targetId);
+    if (recentChatKey && !recentChatKey.startsWith("wxid_")) {
+        return {
+            peerId: recentChatKey,
+            canonicalized: recentChatKey !== targetId,
+            canonicalSource: "recent-sender",
+        };
+    }
+
+    return {
+        peerId: targetId,
+        canonicalized: false,
+    };
+}
+
+function resolveWechatOutboundSessionRoute(params: ChannelOutboundSessionRouteParams) {
+    const targetId = stripWechatRouteTargetPrefixes(params.resolvedTarget?.to || params.target);
+    if (!targetId) {
+        return null;
+    }
+
+    const resolvedKind = params.resolvedTarget?.kind;
+    const isGroup =
+        resolvedKind === "group" ||
+        resolvedKind === "channel" ||
+        targetId.toLowerCase().endsWith("@chatroom");
+    const directPeer = isGroup
+        ? undefined
+        : resolveWechatOutboundDirectSessionPeerId(targetId);
+    const peerId = isGroup ? targetId.trim().toLowerCase() : directPeer!.peerId;
+    if (!peerId) {
+        return null;
+    }
+
+    if (directPeer?.canonicalized) {
+        const runtime = getWechatRuntime();
+        const bridgeConfig = resolveWechatExtensionConfig(params.cfg, (runtime as any)?.logger ?? console);
+        runtime?.logger?.info?.(
+            `[WeChat] Canonicalized outbound direct session target=${summarizeWechatOutboundTextForLog(targetId, bridgeConfig)}` +
+            ` peer=${peerId} source=${directPeer.canonicalSource || "unknown"}` +
+            ` currentSession=${summarizeWechatOutboundTextForLog(params.currentSessionKey, bridgeConfig)}`,
+        );
+    }
+
+    return buildChannelOutboundSessionRoute({
+        cfg: params.cfg,
+        agentId: params.agentId,
+        channel: "wechat",
+        accountId: params.accountId,
+        peer: {
+            kind: isGroup ? "group" : "direct",
+            id: peerId,
+        },
+        chatType: isGroup ? "group" : "direct",
+        from: isGroup ? `wechat:group:${peerId}` : `wechat:${peerId}`,
+        to: isGroup ? `channel:${peerId}` : `user:${peerId}`,
+    });
 }
 
 export const wechatPlugin: ChannelPlugin<any> = {
@@ -325,6 +528,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
         },
     },
     messaging: {
+        resolveOutboundSessionRoute: resolveWechatOutboundSessionRoute,
         targetResolver: {
             hint: "可使用 wxid_xxx、xxx@chatroom，或直接输入群名/备注",
             looksLikeId: (raw: string): boolean => {
@@ -446,7 +650,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
             }
             return { ok: true, channel: "wechat", messageId: `msg-${Date.now()}` };
         },
-        sendMedia: async ({ to, mediaUrl, text, accountId, msg_id, original_msg_id, messageId, replyToId }: any) => {
+        sendMedia: async ({ to, mediaUrl, text, accountId, msg_id, original_msg_id, messageId, replyToId, audioAsVoice }: any) => {
             const runtime = getWechatRuntime();
             const cfg = runtime.config.current();
             const bridgeConfig = resolveWechatExtensionConfig(cfg, (runtime as any).logger ?? console);
@@ -461,9 +665,11 @@ export const wechatPlugin: ChannelPlugin<any> = {
                     .find(Boolean) || "";
             runtime?.logger?.info?.(
                 `[WeChat Outbound] to=${to} account=${accountId || "default"} type=media media="${mediaUrl}"` +
+                `${audioAsVoice === true ? " audioAsVoice=true" : ""}` +
                 `${safeText ? ` text="${summarizeWechatOutboundTextForLog(safeText, bridgeConfig)}"` : ""}`,
             );
             let outboundMediaDedupKey = "";
+            let imageVariantKey = "";
             try {
                 const serveRoots = resolveWechatMediaServeRoots(cfg, (runtime as any).logger ?? console);
 
@@ -532,8 +738,49 @@ export const wechatPlugin: ChannelPlugin<any> = {
                     // 局域网同机部署：直接发送绝对路径，由 Bridge 自主决定是直接读取还是下载。
                     // 这样可以避开不必要的 HTTP 转发和编码消耗。
                     resolvedUrl = absolutePath;
+
+                    const imageVariantDecision = shouldSuppressWechatStagedImageVariant({
+                        to,
+                        accountId,
+                        filePath: absolutePath,
+                        traceId,
+                    });
+                    imageVariantKey = imageVariantDecision.variantKey || "";
+                    if (imageVariantDecision.suppress) {
+                        runtime?.logger?.info?.(
+                            `[WeChat] Suppressing duplicate staged image variant to=${to} account=${accountId || "default"} ` +
+                            `trace=${traceId || "none"} media="${summarizeWechatTextForLog(absolutePath, 180)}"`,
+                        );
+                        if (safeText) {
+                            const textPayload = {
+                                type: "text",
+                                to,
+                                text: safeText,
+                                accountId,
+                                ...(callbackMsgId ? { msg_id: callbackMsgId } : {}),
+                                ...(typeof original_msg_id === "string" && original_msg_id.trim()
+                                    ? { original_msg_id: original_msg_id.trim() }
+                                    : {}),
+                                ...(typeof messageId === "string" && messageId.trim() ? { messageId: messageId.trim() } : {}),
+                                ...(typeof replyToId === "string" && replyToId.trim() ? { replyToId: replyToId.trim() } : {}),
+                            };
+                            const textSent = sendToBridge(buildOutboundFrame("outbound_text", textPayload));
+                            if (!textSent.ok) {
+                                console.error(`[WeChat] sendText fallback after staged-image suppression failed: ${textSent.error}`);
+                                return { ok: false, error: new Error(textSent.error), channel: "wechat", messageId: "" };
+                            }
+                        }
+                        return { ok: true, channel: "wechat", messageId: `msg-${Date.now()}` };
+                    }
                     
-                    console.log(`[WeChat] 媒体路径识别(Local-Direct): ${absolutePath}`);
+                    const localDirectLog =
+                        `[WeChat] 媒体路径识别(Local-Direct) to=${to} account=${accountId || "default"} ` +
+                        `trace=${traceId || "none"} media="${summarizeWechatTextForLog(absolutePath, 180)}"`;
+                    if (runtime?.logger?.info) {
+                        runtime.logger.info(localDirectLog);
+                    } else {
+                        console.log(localDirectLog);
+                    }
                 } else if (mediaUrl) {
                     outboundMediaDedupKey = buildWechatOutboundMediaDedupKey({
                         to,
@@ -555,6 +802,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
                     mediaUrl: resolvedUrl,
                     text: safeText,
                     accountId,
+                    ...(audioAsVoice === true ? { audioAsVoice: true } : {}),
                     ...(callbackMsgId ? { msg_id: callbackMsgId } : {}),
                     ...(typeof original_msg_id === "string" && original_msg_id.trim()
                         ? { original_msg_id: original_msg_id.trim() }
@@ -571,8 +819,23 @@ export const wechatPlugin: ChannelPlugin<any> = {
                     console.error(`[WeChat] sendMedia failed: ${sent.error}`);
                     return { ok: false, error: new Error(sent.error), channel: "wechat", messageId: "" };
                 }
-                console.log(`[WeChat] sendMedia success: msg-${Date.now()}`);
-                return { ok: true, channel: "wechat", messageId: `msg-${Date.now()}` };
+                if (imageVariantKey) {
+                    rememberWechatOutboundImageVariant(
+                        imageVariantKey,
+                        isWechatBridgeStagedMediaPath(resolvedUrl) ? "staged" : "direct",
+                        traceId,
+                    );
+                }
+                const successMessageId = `msg-${Date.now()}`;
+                const successLog =
+                    `[WeChat] sendMedia success to=${to} account=${accountId || "default"} ` +
+                    `trace=${traceId || "none"} messageId=${successMessageId}`;
+                if (runtime?.logger?.info) {
+                    runtime.logger.info(successLog);
+                } else {
+                    console.log(successLog);
+                }
+                return { ok: true, channel: "wechat", messageId: successMessageId };
             } catch (error) {
                 if (outboundMediaDedupKey) {
                     releaseWechatOutboundMediaDedup(outboundMediaDedupKey);

@@ -21,6 +21,7 @@ type PartialWechatExtensionConfig = {
     toolAuthBypassByTool?: Record<string, string[]>;
     toolAuthBlockedSkills?: string[];
     toolAuthAllowInstalledSkills?: boolean;
+    toolAuthAllowSafeReadonlyExec?: boolean;
     toolAuthDebugInstalledSkills?: boolean;
     ownerExecBypassApproval?: boolean;
     toolAuthNotifyBlocked?: boolean;
@@ -55,6 +56,7 @@ export type WechatExtensionConfig = {
     toolAuthBypassByTool: Record<string, string[]>;
     toolAuthBlockedSkills: string[];
     toolAuthAllowInstalledSkills: boolean;
+    toolAuthAllowSafeReadonlyExec: boolean;
     toolAuthDebugInstalledSkills: boolean;
     ownerExecBypassApproval: boolean;
     toolAuthNotifyBlocked: boolean;
@@ -174,6 +176,7 @@ function sanitizeLocalConfig(raw: unknown): PartialWechatExtensionConfig {
         toolAuthBypassByTool: normalizeToolAuthBypassByTool(source.toolAuthBypassByTool),
         toolAuthBlockedSkills: normalizeStringArray(source.toolAuthBlockedSkills),
         toolAuthAllowInstalledSkills: normalizeBoolean(source.toolAuthAllowInstalledSkills),
+        toolAuthAllowSafeReadonlyExec: normalizeBoolean(source.toolAuthAllowSafeReadonlyExec),
         toolAuthDebugInstalledSkills: normalizeBoolean(source.toolAuthDebugInstalledSkills),
         ownerExecBypassApproval: normalizeBoolean(source.ownerExecBypassApproval),
         toolAuthNotifyBlocked: normalizeBoolean(source.toolAuthNotifyBlocked),
@@ -267,6 +270,10 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
         normalizeBoolean(root.toolAuthAllowInstalledSkills) ??
         local.toolAuthAllowInstalledSkills ??
         false;
+    const toolAuthAllowSafeReadonlyExec =
+        normalizeBoolean(root.toolAuthAllowSafeReadonlyExec) ??
+        local.toolAuthAllowSafeReadonlyExec ??
+        false;
     const toolAuthDebugInstalledSkills =
         normalizeBoolean(root.toolAuthDebugInstalledSkills) ??
         local.toolAuthDebugInstalledSkills ??
@@ -344,6 +351,7 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
         toolAuthBypassByTool,
         toolAuthBlockedSkills,
         toolAuthAllowInstalledSkills,
+        toolAuthAllowSafeReadonlyExec,
         toolAuthDebugInstalledSkills,
         ownerExecBypassApproval,
         toolAuthNotifyBlocked,

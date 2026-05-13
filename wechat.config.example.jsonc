@@ -91,6 +91,11 @@
   // 以及这些 skill exec 启动后对应的 process 会话
   "toolAuthAllowInstalledSkills": false,
 
+  // 是否允许非主人执行极少数只读低风险 exec 命令
+  // 当前仅允许 date/pwd/whoami/hostname/uname/id/arch 的固定安全参数形态
+  // 带管道、重定向、命令替换、;、&&、|| 等 shell 组合的命令不会放行
+  "toolAuthAllowSafeReadonlyExec": false,
+
   // 是否输出“已安装 skill 自动放行”调试日志
   // 打开后，当某条 exec/process 没被识别成 skill 放行时
   // 日志里会额外显示失败原因，方便排查

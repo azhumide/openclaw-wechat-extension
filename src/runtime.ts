@@ -100,6 +100,7 @@ const getGlobalState = (): WeChatBridgeState => {
 const TOOL_AUTH_MAX_AGE_MS = 5 * 60 * 1000;
 const TOOL_AUTH_MAX_QUEUE = 50;
 const SKILL_TOOL_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SESSION_END_RECENT_AUTH_PRESERVE_MS = 60 * 1000;
 
 function normalizeWechatTextForMatch(value: string | undefined): string {
     return (value || "").replace(/\r\n/g, "\n").trim();
@@ -112,7 +113,7 @@ function trimQueue(queue: WechatToolAuthRecord[]) {
 }
 
 function getChatKeyFromSessionKey(sessionKey: string | undefined): string | undefined {
-    const trimmed = sessionKey?.trim();
+    const trimmed = sessionKey?.trim()?.toLowerCase();
     if (!trimmed) {
         return undefined;
     }
@@ -188,6 +189,7 @@ function cleanExpiredToolAuth(now = Date.now()) {
 }
 
 export function enqueueWechatInboundToolAuth(entry: WechatToolAuthRecord) {
+    entry.sessionKey = entry.sessionKey.toLowerCase();
     cleanExpiredToolAuth(entry.createdAt);
     const state = getGlobalState();
     state.blockedReplyBySession.delete(entry.sessionKey);
@@ -196,7 +198,7 @@ export function enqueueWechatInboundToolAuth(entry: WechatToolAuthRecord) {
     trimQueue(queue);
     state.pendingToolAuthBySession.set(entry.sessionKey, queue);
 
-    const chatKey = entry.from?.trim() || getChatKeyFromSessionKey(entry.sessionKey);
+    const chatKey = (entry.from?.trim() || getChatKeyFromSessionKey(entry.sessionKey))?.toLowerCase();
     if (chatKey) {
         state.latestToolAuthByChat.set(chatKey, entry);
     }
@@ -212,6 +214,7 @@ export function promoteWechatToolAuthForDispatch(params: {
     senderId?: string;
     content?: string;
 }): WechatToolAuthRecord | undefined {
+    params.sessionKey = params.sessionKey.toLowerCase();
     cleanExpiredToolAuth();
     const state = getGlobalState();
     const queue = state.pendingToolAuthBySession.get(params.sessionKey);
@@ -257,6 +260,7 @@ export function bindWechatToolAuthToRun(params: {
     sessionKey: string;
     runId: string;
 }): WechatToolAuthRecord | undefined {
+    params.sessionKey = params.sessionKey.toLowerCase();
     cleanExpiredToolAuth();
     const state = getGlobalState();
     const queue = state.dispatchToolAuthBySession.get(params.sessionKey);
@@ -282,6 +286,8 @@ export function inheritWechatToolAuthForChildSession(params: {
     childSessionKey: string;
     createdAt?: number;
 }): WechatToolAuthRecord | undefined {
+    params.requesterSessionKey = params.requesterSessionKey.toLowerCase();
+    params.childSessionKey = params.childSessionKey.toLowerCase();
     const createdAt = params.createdAt ?? Date.now();
     cleanExpiredToolAuth(createdAt);
     const state = getGlobalState();
@@ -313,7 +319,7 @@ export function getWechatToolAuthForRun(runId: string): WechatToolAuthRecord | u
 
 export function getWechatToolAuthForSession(sessionKey: string): WechatToolAuthRecord | undefined {
     cleanExpiredToolAuth();
-    const trimmed = sessionKey.trim();
+    const trimmed = sessionKey.trim().toLowerCase();
     if (!trimmed) {
         return undefined;
     }
@@ -326,12 +332,58 @@ export function getWechatToolAuthForSession(sessionKey: string): WechatToolAuthR
 }
 
 export function getWechatToolAuthFallbackForSession(sessionKey: string): WechatToolAuthRecord | undefined {
+    sessionKey = sessionKey.toLowerCase();
     cleanExpiredToolAuth();
     const chatKey = getChatKeyFromSessionKey(sessionKey);
     if (!chatKey) {
         return undefined;
     }
-    return getGlobalState().latestToolAuthByChat.get(chatKey);
+    const state = getGlobalState();
+    const direct = state.latestToolAuthByChat.get(chatKey);
+    if (direct) {
+        return direct;
+    }
+    for (const [storedChatKey, entry] of state.latestToolAuthByChat) {
+        if (storedChatKey.trim().toLowerCase() === chatKey) {
+            return entry;
+        }
+    }
+    return undefined;
+}
+
+export function resolveWechatRecentDirectChatKeyForSender(senderId: string): string | undefined {
+    const normalizedSenderId = senderId.trim().toLowerCase();
+    if (!normalizedSenderId) {
+        return undefined;
+    }
+
+    cleanExpiredToolAuth();
+    const state = getGlobalState();
+    let best:
+        | {
+            chatKey: string;
+            createdAt: number;
+        }
+        | undefined;
+
+    for (const [storedChatKey, entry] of state.latestToolAuthByChat) {
+        const entrySenderId = entry.senderId?.trim().toLowerCase();
+        if (entrySenderId !== normalizedSenderId) {
+            continue;
+        }
+        const chatKey = (entry.from?.trim() || storedChatKey || getChatKeyFromSessionKey(entry.sessionKey))?.toLowerCase();
+        if (!chatKey || chatKey.endsWith("@chatroom") || entry.chatType === "group") {
+            continue;
+        }
+        if (!best || entry.createdAt > best.createdAt) {
+            best = {
+                chatKey,
+                createdAt: entry.createdAt,
+            };
+        }
+    }
+
+    return best?.chatKey;
 }
 
 export function summarizeWechatToolAuthDebugState(params: {
@@ -340,12 +392,14 @@ export function summarizeWechatToolAuthDebugState(params: {
 }): string {
     cleanExpiredToolAuth();
     const state = getGlobalState();
-    const sessionKey = params.sessionKey?.trim();
+    const sessionKey = params.sessionKey?.trim()?.toLowerCase();
     const runId = params.runId?.trim();
     const pendingQueue = sessionKey ? state.pendingToolAuthBySession.get(sessionKey) : undefined;
     const dispatchQueue = sessionKey ? state.dispatchToolAuthBySession.get(sessionKey) : undefined;
     const activeEntry = sessionKey ? state.activeToolAuthBySession.get(sessionKey) : undefined;
     const runEntry = runId ? state.toolAuthByRunId.get(runId) : undefined;
+    const chatKey = getChatKeyFromSessionKey(sessionKey);
+    const chatEntry = chatKey ? state.latestToolAuthByChat.get(chatKey) : undefined;
 
     const parts = [
         `sessionKey=${sessionKey || ""}`,
@@ -354,6 +408,8 @@ export function summarizeWechatToolAuthDebugState(params: {
         `dispatch=${dispatchQueue?.length ?? 0}`,
         `hasActive=${Boolean(activeEntry)}`,
         `hasRun=${Boolean(runEntry)}`,
+        `chatKey=${chatKey || ""}`,
+        `hasChat=${Boolean(chatEntry)}`,
     ];
 
     const activeIsMaster = activeEntry?.isMaster ?? runEntry?.isMaster;
@@ -373,6 +429,12 @@ export function summarizeWechatToolAuthDebugState(params: {
     if (dispatchSender) {
         parts.push(`dispatchSender=${dispatchSender}`);
     }
+    if (chatEntry?.senderId) {
+        parts.push(`chatSender=${chatEntry.senderId}`);
+    }
+    if (typeof chatEntry?.isMaster === "boolean") {
+        parts.push(`chatIsMaster=${chatEntry.isMaster}`);
+    }
 
     return parts.join(" ");
 }
@@ -382,21 +444,36 @@ export function clearWechatToolAuthForRun(runId: string) {
 }
 
 export function clearWechatToolAuthForSession(sessionKey: string) {
+    sessionKey = sessionKey.toLowerCase();
     const state = getGlobalState();
+    const now = Date.now();
+    const preserveCutoff = now - SESSION_END_RECENT_AUTH_PRESERVE_MS;
+    const keepRecent = (entry: WechatToolAuthRecord) => entry.createdAt > preserveCutoff;
+
     state.pendingToolAuthBySession.delete(sessionKey);
     state.dispatchToolAuthBySession.delete(sessionKey);
-    state.activeToolAuthBySession.delete(sessionKey);
-    state.blockedReplyBySession.delete(sessionKey);
+
+    const activeEntry = state.activeToolAuthBySession.get(sessionKey);
+    if (activeEntry && !keepRecent(activeEntry)) {
+        state.activeToolAuthBySession.delete(sessionKey);
+    }
+
+    const blockedReply = state.blockedReplyBySession.get(sessionKey);
+    if (blockedReply && blockedReply.createdAt <= preserveCutoff) {
+        state.blockedReplyBySession.delete(sessionKey);
+    }
+
     for (const [runId, entry] of state.toolAuthByRunId) {
-        if (entry.sessionKey === sessionKey) {
+        if (entry.sessionKey === sessionKey && !keepRecent(entry)) {
             state.toolAuthByRunId.delete(runId);
         }
     }
     // Keep the latest chat-level label/auth snapshot until TTL expiry.
     // Session keys are reused per chat, so session_end from an older turn can race
-    // with a newer inbound message and wipe the fresh group name fallback.
+    // with a newer inbound message and wipe fresh auth. Recent active auth is preserved
+    // for the same reason; cleanExpiredToolAuth handles TTL cleanup.
     for (const [skillSessionId, entry] of state.skillToolSessions) {
-        if (entry.sessionKey === sessionKey) {
+        if (entry.sessionKey === sessionKey && entry.createdAt <= preserveCutoff) {
             state.skillToolSessions.delete(skillSessionId);
         }
     }
@@ -409,6 +486,7 @@ export function markWechatBlockedReplyForSession(params: {
     noticeSent?: boolean;
     createdAt?: number;
 }) {
+    params.sessionKey = params.sessionKey.toLowerCase();
     const createdAt = params.createdAt ?? Date.now();
     cleanExpiredToolAuth(createdAt);
     getGlobalState().blockedReplyBySession.set(params.sessionKey, {
@@ -421,6 +499,7 @@ export function markWechatBlockedReplyForSession(params: {
 }
 
 export function getWechatBlockedReplyForSession(sessionKey: string): WechatBlockedReplyRecord | undefined {
+    sessionKey = sessionKey.toLowerCase();
     cleanExpiredToolAuth();
     return getGlobalState().blockedReplyBySession.get(sessionKey);
 }
@@ -436,7 +515,7 @@ export function rememberWechatSkillToolSession(params: {
     getGlobalState().skillToolSessions.set(params.sessionId, {
         sessionId: params.sessionId,
         skillId: params.skillId,
-        sessionKey: params.sessionKey,
+        sessionKey: params.sessionKey?.toLowerCase(),
         createdAt,
     });
 }
@@ -527,7 +606,11 @@ export function clearBridgeRuntimeState() {
     state.dispatchToolAuthBySession.clear();
     state.activeToolAuthBySession.clear();
     state.toolAuthByRunId.clear();
-    state.latestToolAuthByChat.clear();
+    // NOTE: latestToolAuthByChat is intentionally NOT cleared on bridge disconnect.
+    // It holds the most recent sender identity per chat (keyed by chat ID, not session),
+    // and is used as a fallback when auth context is missing after reconnect.
+    // Clearing it would cause the first tool call after reconnect to lose sender context
+    // and block legitimate owner requests.
     state.blockedReplyBySession.clear();
     state.skillToolSessions.clear();
 }
