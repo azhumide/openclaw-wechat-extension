@@ -41,7 +41,7 @@
   "toolAuthNotifyBlocked": true,
   "toolAuthNotifyApprovalQueued": true,
   "toolAuthNotifyApprovalResolved": true,
-  "toolAuthNotifyInGroup": false,
+  "toolAuthNotifyInGroup": true,
   "toolAuthNotifyInDirect": true,
   "toolAuthMessageBlocked": "你没有权限调用 {{toolName}}。当前来源：{{chatTypeLabel}} / {{conversationLabel}}",
   "toolAuthMessageQueued": "{{toolName}} 已提交审批，请稍候。",

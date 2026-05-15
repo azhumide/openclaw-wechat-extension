@@ -27,6 +27,7 @@ const CACHE_TTL = 60000;
 const contactNameCache: Map<string, { id: string; name: string; type: string; timestamp: number }> = new Map();
 const WECHAT_CHANNEL_MODE = "bridge-ws";
 const WECHAT_REACTION_FALLBACK_MODE = "emoji-message-fallback";
+const WECHAT_MESSAGING_TARGET_PREFIXES = ["wechat", "weixin", "openclaw-weixin", "wechatId"] as const;
 const WECHAT_OUTBOUND_MEDIA_DEDUP_TTL_MS = 10_000;
 const WECHAT_OUTBOUND_MEDIA_DEDUP_SAMPLE_BYTES = 128 * 1024;
 const recentOutboundMediaAt = new Map<string, number>();
@@ -264,12 +265,99 @@ function stripWechatRouteTargetPrefixes(raw: string | undefined): string {
     let next = raw?.trim() || "";
     for (let index = 0; index < 4; index += 1) {
         const previous = next;
-        next = stripTargetKindPrefix(stripChannelTargetPrefix(next, "wechat")).trim();
+        next = stripTargetKindPrefix(
+            stripChannelTargetPrefix(next, ...WECHAT_MESSAGING_TARGET_PREFIXES),
+        ).trim();
         if (next === previous) {
             break;
         }
     }
     return next;
+}
+
+function hasWechatRouteTargetPrefix(raw: string | undefined): boolean {
+    let next = raw?.trim() || "";
+    for (let index = 0; index < 4; index += 1) {
+        if (!next) {
+            return false;
+        }
+        const withoutProvider = stripChannelTargetPrefix(next, ...WECHAT_MESSAGING_TARGET_PREFIXES);
+        if (withoutProvider !== next) {
+            return true;
+        }
+        const withoutKind = stripTargetKindPrefix(next);
+        if (withoutKind === next) {
+            return false;
+        }
+        next = withoutKind.trim();
+    }
+    return false;
+}
+
+function inferWechatRouteTargetChatType(raw: string | undefined): "direct" | "group" | undefined {
+    let next = raw?.trim() || "";
+    for (let index = 0; index < 4; index += 1) {
+        if (!next) {
+            return undefined;
+        }
+        if (/^(group|channel|room):/i.test(next)) {
+            return "group";
+        }
+        if (/^(user|direct|dm):/i.test(next)) {
+            return "direct";
+        }
+        const withoutProvider = stripChannelTargetPrefix(next, ...WECHAT_MESSAGING_TARGET_PREFIXES);
+        if (withoutProvider !== next) {
+            next = withoutProvider.trim();
+            continue;
+        }
+        const withoutKind = stripTargetKindPrefix(next);
+        if (withoutKind === next) {
+            return undefined;
+        }
+        next = withoutKind.trim();
+    }
+    return undefined;
+}
+
+function looksLikeWechatTargetId(raw: string, normalized?: string): boolean {
+    const candidate = stripWechatRouteTargetPrefixes(normalized || raw);
+    if (!candidate) {
+        return false;
+    }
+    const lower = candidate.toLowerCase();
+    if (lower.endsWith("@chatroom")) return true;
+    if (lower.startsWith("wxid_")) return true;
+    if (/^\d{5,}(@chatroom)?$/i.test(candidate)) return true;
+    if (inferWechatRouteTargetChatType(raw)) return true;
+    return hasWechatRouteTargetPrefix(raw);
+}
+
+function normalizeWechatMessagingTarget(raw: string): string | undefined {
+    const targetId = stripWechatRouteTargetPrefixes(raw);
+    if (!targetId) {
+        return undefined;
+    }
+    if (!hasWechatRouteTargetPrefix(raw) && !looksLikeWechatTargetId(raw, targetId)) {
+        return undefined;
+    }
+    return `wechat:${targetId.trim()}`;
+}
+
+function parseWechatExplicitTarget(raw: string): {
+    to: string;
+    chatType?: "direct" | "group";
+} | null {
+    const targetId = stripWechatRouteTargetPrefixes(raw);
+    if (!targetId) {
+        return null;
+    }
+    const explicitChatType = inferWechatRouteTargetChatType(raw);
+    const isGroup = explicitChatType === "group" || targetId.toLowerCase().endsWith("@chatroom");
+    return {
+        to: targetId,
+        chatType: isGroup ? "group" : "direct",
+    };
 }
 
 function resolveWechatOutboundDirectSessionPeerId(targetIdRaw: string): {
@@ -349,6 +437,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
     meta: {
         id: "wechat",
         label: "WeChat",
+        aliases: ["openclaw-weixin", "weixin"],
         selectionLabel: "WeChat (Bridge WS)",
         docsPath: "/docs/channels/wechat",
         blurb: "Connect to WeChat via Python Bridge over WebSocket",
@@ -528,21 +617,18 @@ export const wechatPlugin: ChannelPlugin<any> = {
         },
     },
     messaging: {
+        targetPrefixes: WECHAT_MESSAGING_TARGET_PREFIXES,
+        normalizeTarget: normalizeWechatMessagingTarget,
+        parseExplicitTarget: ({ raw }) => parseWechatExplicitTarget(raw),
+        inferTargetChatType: ({ to }) => parseWechatExplicitTarget(to)?.chatType,
         resolveOutboundSessionRoute: resolveWechatOutboundSessionRoute,
         targetResolver: {
             hint: "可使用 wxid_xxx、xxx@chatroom，或直接输入群名/备注",
-            looksLikeId: (raw: string): boolean => {
-                const trimmed = raw.trim();
-                if (trimmed.endsWith("@chatroom")) return true;
-                if (trimmed.startsWith("wxid_")) return true;
-                if (trimmed.startsWith("wechat:")) return true;
-                if (/^\d{5,}(@chatroom)?$/.test(trimmed)) return true;
-                return false;
-            },
-            resolveTarget: async ({ input }) => {
-                const trimmed = input.trim();
-                const id = trimmed.replace(/^wechat:/i, "");
-                const isGroup = id.endsWith("@chatroom");
+            looksLikeId: looksLikeWechatTargetId,
+            resolveTarget: async ({ input, normalized }) => {
+                const id = stripWechatRouteTargetPrefixes(normalized || input);
+                const explicitChatType = inferWechatRouteTargetChatType(input);
+                const isGroup = explicitChatType === "group" || id.endsWith("@chatroom");
                 return {
                     to: id,
                     kind: isGroup ? "group" : "user",
@@ -619,6 +705,7 @@ export const wechatPlugin: ChannelPlugin<any> = {
     },
     outbound: {
         deliveryMode: "direct",
+        extractMarkdownImages: true,
         sendText: async ({ to, text, accountId, msg_id, original_msg_id, messageId, replyToId }: any) => {
             const runtime = getWechatRuntime();
             const cfg = runtime?.config.current?.() || {};

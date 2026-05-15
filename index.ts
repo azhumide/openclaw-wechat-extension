@@ -1,7 +1,10 @@
 import * as fs from "fs";
+import * as os from "node:os";
 import * as path from "path";
 import { Buffer } from "buffer";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk/core";
@@ -49,7 +52,8 @@ const WECHAT_TOOL_NOTICE_DEDUP_TTL_MS = 120_000;
 const WECHAT_TOOL_AUTH_LOG_DEDUP_TTL_MS = 120_000;
 const WECHAT_REPLY_MEDIA_DEDUP_TTL_MS = 15_000;
 const WECHAT_MEDIA_DEDUP_SAMPLE_BYTES = 128 * 1024;
-const WECHAT_EXTENSION_BUILD_MARKER = "wechat-safe-readonly-exec-20260513";
+const WECHAT_EXTENSION_BUILD_MARKER = "wechat-subagent-core-runtime-channel-exact-canon-20260515";
+const WECHAT_LEGACY_CHANNEL_IDS = new Set(["openclaw-weixin", "weixin", "wechatid"]);
 
 type WechatBridgeGlobalState = {
     runtime: OpenClawPluginApi["runtime"] | null;
@@ -387,6 +391,854 @@ function redactWechatPayloadForLogs(
         enabled: config?.redactWxidsInLogs !== false,
         exactMatches: config?.redactExtraWxids,
     });
+}
+
+function canonicalWechatChannelId(value: unknown): "wechat" | undefined {
+    if (typeof value !== "string") {
+        return undefined;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "wechat" || WECHAT_LEGACY_CHANNEL_IDS.has(normalized)) {
+        return "wechat";
+    }
+    return undefined;
+}
+
+const WECHAT_CANONICAL_CHANNEL_ID = "wechat";
+const WECHAT_LEGACY_CHANNEL_ALIASES = ["openclaw-weixin", "weixin", "wechatId"];
+const pluginRegistryStateSym = Symbol.for("openclaw.pluginRegistryState");
+
+type WechatSubagentRegistryRuntimeModule = {
+    getSubagentRunByChildSessionKey?: (childSessionKey: string) => unknown;
+    getLatestSubagentRunByChildSessionKey?: (childSessionKey: string) => unknown;
+    listSubagentRunsForRequester?: (requesterSessionKey: string) => unknown[];
+    addSubagentRunForTests?: (entry: unknown) => void;
+};
+
+type WechatPluginRegistryRuntimeModule = {
+    getActivePluginRegistry?: () => unknown;
+    getActivePluginChannelRegistry?: () => unknown;
+};
+
+let wechatSubagentRegistryRuntimePromise: Promise<WechatSubagentRegistryRuntimeModule | null> | null = null;
+let wechatPluginRegistryRuntimePromise: Promise<WechatPluginRegistryRuntimeModule | null> | null = null;
+
+function canonicalizeWechatChannelPluginShape(plugin: any): boolean {
+    if (!plugin || typeof plugin !== "object") {
+        return false;
+    }
+
+    const rawId = typeof plugin.id === "string" ? plugin.id.trim() : "";
+    const rawMetaId = typeof plugin.meta?.id === "string" ? plugin.meta.id.trim() : "";
+    const rawAliases = Array.isArray(plugin.meta?.aliases) ? plugin.meta.aliases : [];
+    const isWechatish =
+        Boolean(canonicalWechatChannelId(rawId)) ||
+        Boolean(canonicalWechatChannelId(rawMetaId)) ||
+        rawAliases.some((alias: unknown) => Boolean(canonicalWechatChannelId(alias)));
+
+    if (!isWechatish) {
+        return false;
+    }
+
+    let changed = false;
+    if (rawId !== WECHAT_CANONICAL_CHANNEL_ID) {
+        plugin.id = WECHAT_CANONICAL_CHANNEL_ID;
+        changed = true;
+    }
+
+    if (!plugin.meta || typeof plugin.meta !== "object") {
+        plugin.meta = {};
+        changed = true;
+    }
+
+    if (plugin.meta.id !== WECHAT_CANONICAL_CHANNEL_ID) {
+        plugin.meta.id = WECHAT_CANONICAL_CHANNEL_ID;
+        changed = true;
+    }
+
+    const aliases = Array.isArray(plugin.meta.aliases) ? [...plugin.meta.aliases] : [];
+    const aliasKeys = new Set(
+        aliases
+            .filter((alias) => typeof alias === "string")
+            .map((alias: string) => alias.trim().toLowerCase())
+            .filter(Boolean),
+    );
+    for (const alias of WECHAT_LEGACY_CHANNEL_ALIASES) {
+        const aliasKey = alias.trim().toLowerCase();
+        if (!aliasKeys.has(aliasKey)) {
+            aliases.push(alias);
+            aliasKeys.add(aliasKey);
+            changed = true;
+        }
+    }
+
+    if (changed || plugin.meta.aliases !== aliases) {
+        plugin.meta.aliases = aliases;
+    }
+    return changed;
+}
+
+function summarizeWechatChannelRegistryIds(registry: any): string {
+    const channels = Array.isArray(registry?.channels) ? registry.channels : [];
+    return channels
+        .map((entry: any) => typeof entry?.plugin?.id === "string" ? entry.plugin.id : "")
+        .filter(Boolean)
+        .join(",");
+}
+
+function canonicalizeWechatChannelRegistryObject(registry: any): {
+    patched: number;
+    reordered: number;
+    beforeIds: string;
+    afterIds: string;
+} {
+    const beforeIds = summarizeWechatChannelRegistryIds(registry);
+    let patched = 0;
+    let reordered = 0;
+    const lists = [
+        Array.isArray(registry?.channels) ? registry.channels : undefined,
+        Array.isArray(registry?.channelSetups) ? registry.channelSetups : undefined,
+    ].filter(Boolean) as any[][];
+
+    for (const entries of lists) {
+        const nativeWechatIndex = entries.findIndex((entry) =>
+            typeof entry?.plugin?.id === "string" &&
+            entry.plugin.id.trim() === WECHAT_CANONICAL_CHANNEL_ID,
+        );
+        for (const entry of entries) {
+            if (canonicalizeWechatChannelPluginShape(entry?.plugin)) {
+                patched += 1;
+            }
+        }
+
+        const currentIndex = entries.findIndex((entry) => entry?.plugin === wechatPlugin);
+        const preferredIndex = currentIndex >= 0 ? currentIndex : nativeWechatIndex;
+        if (preferredIndex <= 0) {
+            continue;
+        }
+
+        const firstWechatIndex = entries.findIndex((entry, index) =>
+            index !== preferredIndex && Boolean(canonicalWechatChannelId(entry?.plugin?.id)),
+        );
+        if (firstWechatIndex >= 0 && firstWechatIndex < preferredIndex) {
+            const [preferredEntry] = entries.splice(preferredIndex, 1);
+            entries.splice(firstWechatIndex, 0, preferredEntry);
+            reordered += 1;
+        }
+    }
+
+    return {
+        patched,
+        reordered,
+        beforeIds,
+        afterIds: summarizeWechatChannelRegistryIds(registry),
+    };
+}
+
+function canonicalizeWechatGlobalChannelRegistry(
+    api: OpenClawPluginApi | undefined,
+    reason: string,
+): number {
+    const state = (globalThis as Record<symbol, any>)[pluginRegistryStateSym];
+    const registries = [
+        state?.channel?.registry,
+        state?.activeRegistry,
+    ].filter((registry, index, list) => registry && list.indexOf(registry) === index);
+
+    let patched = 0;
+    let reordered = 0;
+    const beforeIds: string[] = [];
+    const afterIds: string[] = [];
+    for (const registry of registries) {
+        const result = canonicalizeWechatChannelRegistryObject(registry);
+        patched += result.patched;
+        reordered += result.reordered;
+        if (result.patched > 0 || result.reordered > 0) {
+            beforeIds.push(result.beforeIds);
+            afterIds.push(result.afterIds);
+        }
+    }
+
+    if (patched > 0 || reordered > 0) {
+        api?.logger.info?.(
+            `[WeChat] Canonicalized active channel registry reason=${reason}` +
+            ` patched=${patched} reordered=${reordered}` +
+            `${beforeIds.length > 0 ? ` ids=${beforeIds.join("|")}=>${afterIds.join("|")}` : ""}`,
+        );
+    }
+    return patched + reordered;
+}
+
+async function loadWechatPluginRegistryRuntime(
+    api?: OpenClawPluginApi,
+): Promise<WechatPluginRegistryRuntimeModule | null> {
+    if (!wechatPluginRegistryRuntimePromise) {
+        wechatPluginRegistryRuntimePromise = (async () => {
+            try {
+                const require = createRequire(import.meta.url);
+                const sdkCorePath = require.resolve("openclaw/plugin-sdk/core");
+                const distDir = path.dirname(path.dirname(sdkCorePath));
+                const candidates = [
+                    path.join(distDir, "plugins", "runtime.js"),
+                    path.join(distDir, "src", "plugins", "runtime.js"),
+                ];
+                for (const candidate of candidates) {
+                    if (!wechatPathExists(candidate)) {
+                        continue;
+                    }
+                    return await import(pathToFileURL(candidate).href) as WechatPluginRegistryRuntimeModule;
+                }
+                api?.logger.debug?.(
+                    `[WeChat] Plugin registry runtime module not found from ${sdkCorePath}`,
+                );
+            } catch (err: any) {
+                api?.logger.debug?.(
+                    `[WeChat] Failed to load plugin registry runtime for channel canonicalization err=${err?.message || err}`,
+                );
+            }
+            return null;
+        })();
+    }
+    return wechatPluginRegistryRuntimePromise;
+}
+
+async function canonicalizeWechatCoreRuntimeChannelRegistries(
+    api: OpenClawPluginApi | undefined,
+    reason: string,
+): Promise<number> {
+    const runtimeModule = await loadWechatPluginRegistryRuntime(api);
+    if (!runtimeModule) {
+        return 0;
+    }
+
+    const registries = [
+        runtimeModule.getActivePluginChannelRegistry?.(),
+        runtimeModule.getActivePluginRegistry?.(),
+    ].filter((registry, index, list) => registry && list.indexOf(registry) === index);
+
+    let patched = 0;
+    let reordered = 0;
+    const beforeIds: string[] = [];
+    const afterIds: string[] = [];
+    for (const registry of registries) {
+        const result = canonicalizeWechatChannelRegistryObject(registry);
+        patched += result.patched;
+        reordered += result.reordered;
+        if (result.patched > 0 || result.reordered > 0) {
+            beforeIds.push(result.beforeIds);
+            afterIds.push(result.afterIds);
+        }
+    }
+
+    if (patched > 0 || reordered > 0) {
+        api?.logger.info?.(
+            `[WeChat] Canonicalized core channel registry reason=${reason}` +
+            ` patched=${patched} reordered=${reordered}` +
+            `${beforeIds.length > 0 ? ` ids=${beforeIds.join("|")}=>${afterIds.join("|")}` : ""}`,
+        );
+    }
+    return patched + reordered;
+}
+
+async function loadWechatSubagentRegistryRuntime(
+    api?: OpenClawPluginApi,
+): Promise<WechatSubagentRegistryRuntimeModule | null> {
+    if (!wechatSubagentRegistryRuntimePromise) {
+        wechatSubagentRegistryRuntimePromise = (async () => {
+            try {
+                const require = createRequire(import.meta.url);
+                const sdkCorePath = require.resolve("openclaw/plugin-sdk/core");
+                const distDir = path.dirname(path.dirname(sdkCorePath));
+                const candidates = [
+                    path.join(distDir, "agents", "subagent-registry.js"),
+                    path.join(distDir, "src", "agents", "subagent-registry.js"),
+                ];
+                for (const candidate of candidates) {
+                    if (!wechatPathExists(candidate)) {
+                        continue;
+                    }
+                    return await import(pathToFileURL(candidate).href) as WechatSubagentRegistryRuntimeModule;
+                }
+                api?.logger.debug?.(
+                    `[WeChat] Subagent registry runtime module not found from ${sdkCorePath}`,
+                );
+            } catch (err: any) {
+                api?.logger.debug?.(
+                    `[WeChat] Failed to load subagent registry runtime for in-memory canonicalization err=${err?.message || err}`,
+                );
+            }
+            return null;
+        })();
+    }
+    return wechatSubagentRegistryRuntimePromise;
+}
+
+async function canonicalizeWechatActiveSubagentRuntimeOrigins(params: {
+    api: OpenClawPluginApi;
+    childRunId?: string;
+    childSessionKey?: string;
+    requesterSessionKey?: string;
+    reason?: string;
+}): Promise<number> {
+    const runtimeModule = await loadWechatSubagentRegistryRuntime(params.api);
+    if (!runtimeModule) {
+        return 0;
+    }
+
+    const candidates: unknown[] = [];
+    const addCandidate = (entry: unknown) => {
+        if (!isWechatPlainObject(entry)) {
+            return;
+        }
+        candidates.push(entry);
+    };
+
+    const childSessionKey = params.childSessionKey?.trim();
+    if (childSessionKey) {
+        addCandidate(runtimeModule.getSubagentRunByChildSessionKey?.(childSessionKey));
+        addCandidate(runtimeModule.getLatestSubagentRunByChildSessionKey?.(childSessionKey));
+    }
+
+    const requesterSessionKey = params.requesterSessionKey?.trim();
+    if (requesterSessionKey && typeof runtimeModule.listSubagentRunsForRequester === "function") {
+        for (const entry of runtimeModule.listSubagentRunsForRequester(requesterSessionKey) || []) {
+            if (!isWechatPlainObject(entry)) {
+                continue;
+            }
+            const runId = typeof entry.runId === "string" ? entry.runId.trim() : "";
+            const entryChildSessionKey =
+                typeof entry.childSessionKey === "string" ? entry.childSessionKey.trim() : "";
+            if (
+                (params.childRunId && runId && runId !== params.childRunId) ||
+                (childSessionKey && entryChildSessionKey && entryChildSessionKey !== childSessionKey)
+            ) {
+                continue;
+            }
+            addCandidate(entry);
+        }
+    }
+
+    const seen = new Set<string>();
+    let patchedCount = 0;
+    for (const candidate of candidates) {
+        if (!isWechatPlainObject(candidate)) {
+            continue;
+        }
+        const runId =
+            typeof candidate.runId === "string" && candidate.runId.trim()
+                ? candidate.runId.trim()
+                : `object:${seen.size}`;
+        if (seen.has(runId)) {
+            continue;
+        }
+        seen.add(runId);
+
+        const patched = withPatchedWechatSubagentRunRecord(candidate);
+        if (!patched.changed || !isWechatPlainObject(patched.entry)) {
+            continue;
+        }
+
+        Object.assign(candidate, patched.entry);
+        if (typeof candidate.runId === "string" && candidate.runId.trim()) {
+            runtimeModule.addSubagentRunForTests?.(candidate);
+        }
+        patchedCount += 1;
+    }
+
+    if (patchedCount > 0) {
+        params.api.logger.info?.(
+            `[WeChat] Canonicalized active subagent runtime origins` +
+            `${params.reason ? ` reason=${params.reason}` : ""}` +
+            `${params.childRunId ? ` runId=${params.childRunId}` : ""}` +
+            `${params.childSessionKey ? ` child=${params.childSessionKey}` : ""}` +
+            `${params.requesterSessionKey ? ` requester=${params.requesterSessionKey}` : ""}` +
+            ` patched=${patchedCount}`,
+        );
+    }
+    return patchedCount;
+}
+
+type WechatDeliveryOrigin = {
+    channel?: string;
+    accountId?: string;
+    to?: string;
+    threadId?: string | number;
+};
+
+function parseWechatDeliveryRouteFromSessionKey(sessionKey: string | undefined): {
+    to: string;
+    threadId: string;
+    chatType?: "direct" | "group";
+} | undefined {
+    const trimmed = sessionKey?.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+
+    const parts = trimmed.split(":").map((part) => part.trim());
+    for (let index = 0; index < parts.length; index += 1) {
+        if (!canonicalWechatChannelId(parts[index])) {
+            continue;
+        }
+
+        const rawKind = parts[index + 1]?.toLowerCase() || "";
+        const chatType =
+            rawKind === "group" || rawKind === "channel" || rawKind === "room"
+                ? "group"
+                : rawKind === "direct" || rawKind === "user" || rawKind === "dm"
+                    ? "direct"
+                    : undefined;
+        const targetStartIndex = chatType ? index + 2 : index + 1;
+        const to = parts.slice(targetStartIndex).join(":").trim();
+        if (!to) {
+            return undefined;
+        }
+
+        return {
+            to,
+            threadId: to,
+            chatType: chatType || (to.toLowerCase().endsWith("@chatroom") ? "group" : undefined),
+        };
+    }
+
+    return undefined;
+}
+
+function normalizeWechatSubagentDeliveryOrigin(params: {
+    origin?: WechatDeliveryOrigin;
+    requesterSessionKey?: string;
+}): {
+    origin: WechatDeliveryOrigin;
+    previousChannel?: string;
+    inferredFromSession: boolean;
+    changed: boolean;
+} | undefined {
+    const source = params.origin && typeof params.origin === "object" ? params.origin : undefined;
+    const sessionRoute = parseWechatDeliveryRouteFromSessionKey(params.requesterSessionKey);
+    const previousChannel = typeof source?.channel === "string" ? source.channel.trim() : "";
+    const canonicalChannel = canonicalWechatChannelId(previousChannel);
+    if (!canonicalChannel && !sessionRoute) {
+        return undefined;
+    }
+
+    const rawTo = typeof source?.to === "string" ? source.to.trim() : "";
+    const normalizedTo = rawTo ? normalizeWechatMessageToolTarget(rawTo) : "";
+    const to = normalizedTo || sessionRoute?.to;
+    if (!to) {
+        return undefined;
+    }
+
+    const accountId =
+        typeof source?.accountId === "string" && source.accountId.trim()
+            ? source.accountId.trim()
+            : "default";
+    const sourceThreadId =
+        typeof source?.threadId === "string" && source.threadId.trim()
+            ? source.threadId.trim()
+            : (typeof source?.threadId === "number" && Number.isFinite(source.threadId)
+                ? source.threadId
+                : undefined);
+    const threadId = sourceThreadId ?? sessionRoute?.threadId ?? to;
+    const origin: WechatDeliveryOrigin = {
+        channel: "wechat",
+        accountId,
+        to,
+        ...(threadId != null && threadId !== "" ? { threadId } : {}),
+    };
+    const changed =
+        previousChannel !== "wechat" ||
+        rawTo !== to ||
+        !source?.accountId ||
+        sourceThreadId == null;
+
+    return {
+        origin,
+        previousChannel: previousChannel || undefined,
+        inferredFromSession: !normalizedTo && Boolean(sessionRoute),
+        changed,
+    };
+}
+
+const WECHAT_LEGACY_CHANNEL_FIELD_NAMES = new Set([
+    "channel",
+    "lastchannel",
+    "replychannel",
+    "messagechannel",
+    "currentchannelprovider",
+    "provider",
+    "surface",
+    "originatingchannel",
+    "sourcechannel",
+    "turnsourcechannel",
+]);
+
+function withPatchedWechatLegacyChannelFields(entry: any): { entry: any; changed: boolean } {
+    const patchValue = (value: unknown, depth: number): { value: unknown; changed: boolean } => {
+        if (!value || typeof value !== "object" || depth > 8) {
+            return { value, changed: false };
+        }
+
+        if (Array.isArray(value)) {
+            let nextArray: unknown[] | undefined;
+            value.forEach((item, index) => {
+                const patched = patchValue(item, depth + 1);
+                if (!patched.changed) {
+                    return;
+                }
+                if (!nextArray) {
+                    nextArray = [...value];
+                }
+                nextArray[index] = patched.value;
+            });
+            return nextArray ? { value: nextArray, changed: true } : { value, changed: false };
+        }
+
+        const source = value as Record<string, unknown>;
+        let next: Record<string, unknown> | undefined;
+        const ensureNext = () => {
+            if (!next) {
+                next = { ...source };
+            }
+            return next;
+        };
+
+        for (const [key, fieldValue] of Object.entries(source)) {
+            if (WECHAT_LEGACY_CHANNEL_FIELD_NAMES.has(key.toLowerCase())) {
+                const canonical = canonicalWechatChannelId(fieldValue);
+                if (canonical && fieldValue !== canonical) {
+                    ensureNext()[key] = canonical;
+                    continue;
+                }
+            }
+
+            if (fieldValue && typeof fieldValue === "object") {
+                const patched = patchValue(fieldValue, depth + 1);
+                if (patched.changed) {
+                    ensureNext()[key] = patched.value;
+                }
+            }
+        }
+
+        return next ? { value: next, changed: true } : { value, changed: false };
+    };
+
+    const patched = patchValue(entry, 0);
+    return {
+        entry: patched.value,
+        changed: patched.changed,
+    };
+}
+
+async function canonicalizeWechatSessionStoreRoute(params: {
+    api: OpenClawPluginApi;
+    storePath: string;
+    sessionKey: string;
+}) {
+    await updateSessionStore(
+        params.storePath,
+        (store) => {
+            const resolved = resolveSessionStoreEntry({
+                store,
+                sessionKey: params.sessionKey,
+            });
+            const existing = resolved.existing;
+            if (!existing) {
+                return null;
+            }
+            const patched = withPatchedWechatLegacyChannelFields(existing);
+            if (!patched.changed && resolved.legacyKeys.length === 0) {
+                return existing;
+            }
+            store[resolved.normalizedKey] = patched.entry;
+            for (const legacyKey of resolved.legacyKeys) {
+                delete store[legacyKey];
+            }
+            return patched.entry;
+        },
+        { activeSessionKey: params.sessionKey },
+    );
+}
+
+async function canonicalizeWechatSessionStoreRouteForConfig(params: {
+    api: OpenClawPluginApi;
+    cfg: Record<string, unknown>;
+    sessionKey?: string;
+    reason?: string;
+    force?: boolean;
+}) {
+    const sessionKey = params.sessionKey?.trim();
+    if (!sessionKey) {
+        return;
+    }
+    const sessionRoute = parseWechatDeliveryRouteFromSessionKey(sessionKey);
+    if (!params.force && !sessionRoute && !sessionKey.toLowerCase().includes(":wechat:")) {
+        return;
+    }
+
+    try {
+        const storePath = params.api.runtime.channel.session.resolveStorePath(
+            (params.cfg as any)?.session?.store,
+            { agentId: "main" },
+        );
+        await canonicalizeWechatSessionStoreRoute({
+            api: params.api,
+            storePath,
+            sessionKey,
+        });
+    } catch (err: any) {
+        params.api.logger.warn?.(
+            `[WeChat] Failed to canonicalize session route` +
+            `${params.reason ? ` reason=${params.reason}` : ""}` +
+            ` session=${sessionKey} err=${err?.message || err}`,
+        );
+    }
+}
+
+function resolveWechatHomeDir(): string {
+    const homeDir =
+        process.env.OPENCLAW_HOME?.trim() ||
+        process.env.HOME?.trim() ||
+        process.env.USERPROFILE?.trim() ||
+        os.homedir();
+    return path.resolve(homeDir || process.cwd());
+}
+
+function resolveWechatUserPath(rawPath: string): string {
+    const trimmed = rawPath.trim();
+    if (trimmed === "~") {
+        return resolveWechatHomeDir();
+    }
+    if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+        return path.resolve(path.join(resolveWechatHomeDir(), trimmed.slice(2)));
+    }
+    return path.resolve(trimmed);
+}
+
+function wechatPathExists(filePath: string): boolean {
+    try {
+        return fs.existsSync(filePath);
+    } catch {
+        return false;
+    }
+}
+
+function resolveWechatStateDirForRegistry(): string {
+    const explicitStateDir = process.env.OPENCLAW_STATE_DIR?.trim();
+    if (explicitStateDir) {
+        return resolveWechatUserPath(explicitStateDir);
+    }
+
+    const homeDir = resolveWechatHomeDir();
+    const newStateDir = path.join(homeDir, ".openclaw");
+    if (process.env.OPENCLAW_TEST_FAST === "1" || wechatPathExists(newStateDir)) {
+        return newStateDir;
+    }
+
+    const legacyStateDir = path.join(homeDir, ".clawdbot");
+    if (wechatPathExists(legacyStateDir)) {
+        return legacyStateDir;
+    }
+    return newStateDir;
+}
+
+function resolveWechatSubagentRegistryPath(): string {
+    return path.join(resolveWechatStateDirForRegistry(), "subagents", "runs.json");
+}
+
+function isWechatPlainObject(value: unknown): value is Record<string, unknown> {
+    return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function wechatDeliveryOriginsEqual(
+    left: WechatDeliveryOrigin | undefined,
+    right: WechatDeliveryOrigin | undefined,
+): boolean {
+    if (!left && !right) {
+        return true;
+    }
+    if (!left || !right) {
+        return false;
+    }
+    return (
+        left.channel === right.channel &&
+        left.accountId === right.accountId &&
+        left.to === right.to &&
+        String(left.threadId ?? "") === String(right.threadId ?? "")
+    );
+}
+
+function withCanonicalWechatOriginOnObject(params: {
+    value: Record<string, unknown>;
+    originKey: string;
+    sessionKey?: unknown;
+}): { value: Record<string, unknown>; changed: boolean } {
+    const sessionKey = typeof params.sessionKey === "string" ? params.sessionKey : undefined;
+    const existingOrigin = isWechatPlainObject(params.value[params.originKey])
+        ? params.value[params.originKey] as WechatDeliveryOrigin
+        : undefined;
+    const normalized = normalizeWechatSubagentDeliveryOrigin({
+        origin: existingOrigin,
+        requesterSessionKey: sessionKey,
+    });
+    if (!normalized || wechatDeliveryOriginsEqual(existingOrigin, normalized.origin)) {
+        return { value: params.value, changed: false };
+    }
+    return {
+        value: {
+            ...params.value,
+            [params.originKey]: normalized.origin,
+        },
+        changed: true,
+    };
+}
+
+function withPatchedWechatSubagentRunRecord(entry: unknown): { entry: unknown; changed: boolean } {
+    if (!isWechatPlainObject(entry)) {
+        return { entry, changed: false };
+    }
+
+    const recursivePatched = withPatchedWechatLegacyChannelFields(entry);
+    let next = recursivePatched.entry;
+    let changed = recursivePatched.changed;
+    const ensureRunObject = () => next as Record<string, unknown>;
+
+    const topOriginPatch = withCanonicalWechatOriginOnObject({
+        value: ensureRunObject(),
+        originKey: "requesterOrigin",
+        sessionKey: ensureRunObject().requesterSessionKey,
+    });
+    if (topOriginPatch.changed) {
+        next = topOriginPatch.value;
+        changed = true;
+    }
+
+    const runObject = ensureRunObject();
+    if (isWechatPlainObject(runObject.pendingFinalDeliveryPayload)) {
+        const payload = runObject.pendingFinalDeliveryPayload;
+        const payloadOriginPatch = withCanonicalWechatOriginOnObject({
+            value: payload,
+            originKey: "requesterOrigin",
+            sessionKey: payload.requesterSessionKey || runObject.requesterSessionKey,
+        });
+        if (payloadOriginPatch.changed) {
+            next = {
+                ...runObject,
+                pendingFinalDeliveryPayload: payloadOriginPatch.value,
+            };
+            changed = true;
+        }
+    }
+
+    return { entry: next, changed };
+}
+
+async function canonicalizeWechatSubagentRegistryOrigins(params: {
+    api: OpenClawPluginApi;
+    childRunId?: string;
+    requesterSessionKey?: string;
+    reason?: string;
+}) {
+    const registryPath = resolveWechatSubagentRegistryPath();
+    if (!wechatPathExists(registryPath)) {
+        return;
+    }
+
+    try {
+        const raw = await fs.promises.readFile(registryPath, "utf8");
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (!isWechatPlainObject(parsed.runs)) {
+            return;
+        }
+
+        let nextRuns: Record<string, unknown> | undefined;
+        let patchedCount = 0;
+        const ensureRuns = () => {
+            if (!nextRuns) {
+                nextRuns = { ...(parsed.runs as Record<string, unknown>) };
+            }
+            return nextRuns;
+        };
+
+        for (const [runId, runEntry] of Object.entries(parsed.runs)) {
+            const patched = withPatchedWechatSubagentRunRecord(runEntry);
+            if (!patched.changed) {
+                continue;
+            }
+            ensureRuns()[runId] = patched.entry;
+            patchedCount += 1;
+        }
+
+        if (!nextRuns || patchedCount === 0) {
+            return;
+        }
+
+        const nextRegistry = {
+            ...parsed,
+            runs: nextRuns,
+        };
+        await fs.promises.mkdir(path.dirname(registryPath), { recursive: true });
+        const tmpPath = `${registryPath}.${process.pid}.${Date.now()}.tmp`;
+        await fs.promises.writeFile(tmpPath, `${JSON.stringify(nextRegistry, null, 2)}\n`, "utf8");
+        await fs.promises.rename(tmpPath, registryPath);
+        params.api.logger.info?.(
+            `[WeChat] Canonicalized subagent registry origins` +
+            `${params.reason ? ` reason=${params.reason}` : ""}` +
+            `${params.childRunId ? ` runId=${params.childRunId}` : ""}` +
+            `${params.requesterSessionKey ? ` requester=${params.requesterSessionKey}` : ""}` +
+            ` patched=${patchedCount}`,
+        );
+    } catch (err: any) {
+        params.api.logger.warn?.(
+            `[WeChat] Failed to canonicalize subagent registry origins` +
+            `${params.reason ? ` reason=${params.reason}` : ""}` +
+            `${params.childRunId ? ` runId=${params.childRunId}` : ""}` +
+            ` path=${registryPath} err=${err?.message || err}`,
+        );
+    }
+}
+
+async function recordWechatInboundSessionRoute(params: {
+    api: OpenClawPluginApi;
+    cfg: Record<string, unknown>;
+    sessionKey: string;
+    ctx: Record<string, unknown>;
+    to: string;
+    accountId: string;
+    threadId: string;
+}) {
+    try {
+        const storePath = params.api.runtime.channel.session.resolveStorePath(
+            (params.cfg as any)?.session?.store,
+            { agentId: "main" },
+        );
+        await params.api.runtime.channel.session.recordSessionMetaFromInbound({
+            storePath,
+            sessionKey: params.sessionKey,
+            ctx: params.ctx as any,
+            createIfMissing: true,
+        });
+        await params.api.runtime.channel.session.updateLastRoute({
+            storePath,
+            sessionKey: params.sessionKey,
+            deliveryContext: {
+                channel: "wechat",
+                to: params.to,
+                accountId: params.accountId,
+                threadId: params.threadId,
+            },
+            ctx: params.ctx as any,
+            createIfMissing: true,
+        });
+        await canonicalizeWechatSessionStoreRoute({
+            api: params.api,
+            storePath,
+            sessionKey: params.sessionKey,
+        });
+    } catch (err: any) {
+        params.api.logger.warn?.(
+            `[WeChat] Failed to record canonical session route session=${params.sessionKey} err=${err?.message || err}`,
+        );
+    }
 }
 
 async function refreshWechatDirectSessionDisplayName(params: {
@@ -1313,7 +2165,69 @@ function isWechatSafeDateArg(arg: string): boolean {
     return false;
 }
 
-function isWechatSafeReadonlyExecSegment(segment: string): {
+function resolveWechatSafeReadonlyExecRoots(config: ReturnType<typeof resolveWechatExtensionConfig>): string[] {
+    const roots = new Set<string>();
+    const pushRoot = (candidate?: string) => {
+        const normalized = String(candidate || "").trim();
+        if (normalized) {
+            roots.add(path.resolve(normalized));
+        }
+    };
+
+    pushRoot(config.workspaceBase);
+    if (config.workspaceBase) {
+        pushRoot(path.join(config.workspaceBase, "downloads"));
+    }
+    pushRoot(config.tmpDir);
+    for (const candidate of config.mediaSearchPaths || []) {
+        pushRoot(candidate);
+    }
+    return [...roots];
+}
+
+function isWechatSafeReadonlyPathProbe(params: {
+    execBase: string;
+    args: string[];
+    workdir?: string;
+    safePathRoots?: string[];
+}): boolean {
+    const safePathRoots = (params.safePathRoots || []).map((root) => path.resolve(root));
+    if (safePathRoots.length === 0) {
+        return false;
+    }
+
+    const allowedFlagsByCommand: Record<string, RegExp> = {
+        ls: /^(?:-[A-Za-z0-9]+|--(?:all|almost-all|directory|dereference|human-readable|long|color=never))$/,
+        stat: /^(?:-[A-Za-z]+|--(?:dereference|file-system|terse))$/,
+        readlink: /^(?:-[A-Za-z]+|--(?:canonicalize|canonicalize-existing|canonicalize-missing|no-newline|verbose|quiet|silent))$/,
+    };
+    const allowedFlag = allowedFlagsByCommand[params.execBase];
+    if (!allowedFlag) {
+        return false;
+    }
+
+    let pathArgCount = 0;
+    for (const arg of params.args) {
+        if (arg.startsWith("-")) {
+            if (!allowedFlag.test(arg)) {
+                return false;
+            }
+            continue;
+        }
+        const candidatePath = resolveWechatCommandPathCandidate(arg, params.workdir);
+        if (!candidatePath || !isWechatPathWithinRoots(candidatePath, safePathRoots)) {
+            return false;
+        }
+        pathArgCount += 1;
+    }
+
+    return pathArgCount > 0;
+}
+
+function isWechatSafeReadonlyExecSegment(segment: string, params?: {
+    workdir?: string;
+    safePathRoots?: string[];
+}): {
     matched: boolean;
     command?: string;
 } {
@@ -1374,10 +2288,22 @@ function isWechatSafeReadonlyExecSegment(segment: string): {
         };
     }
 
+    if (execBase === "ls" || execBase === "stat" || execBase === "readlink") {
+        return {
+            matched: isWechatSafeReadonlyPathProbe({
+                execBase,
+                args,
+                workdir: params?.workdir,
+                safePathRoots: params?.safePathRoots,
+            }),
+            command: execBase,
+        };
+    }
+
     return { matched: false };
 }
 
-function resolveWechatSafeReadonlyExecCommandMatch(command: string, workdir: string | undefined): {
+function resolveWechatSafeReadonlyExecCommandMatch(command: string, workdir: string | undefined, safePathRoots?: string[]): {
     matched: boolean;
     command?: string;
     normalized?: string;
@@ -1406,7 +2332,10 @@ function resolveWechatSafeReadonlyExecCommandMatch(command: string, workdir: str
         return { matched: false, reason: "multiple-segments" };
     }
 
-    const segmentMatch = isWechatSafeReadonlyExecSegment(segments[0]);
+    const segmentMatch = isWechatSafeReadonlyExecSegment(segments[0], {
+        workdir: unwrapped.workdir || workdir,
+        safePathRoots,
+    });
     if (!segmentMatch.matched) {
         return { matched: false, reason: "not-allowlisted" };
     }
@@ -2181,6 +3110,10 @@ function isWechatToolFailureSummaryReply(text: string): boolean {
         return false;
     }
 
+    if (/^(?:⚠️\s*(?:[^\w\s]+\s*)*)?Message\s+failed[.!?]*$/i.test(normalized)) {
+        return true;
+    }
+
     return /^⚠️(?:\s*[^\w\s]+\s*)*[A-Za-z][\w-]*:\s*[\s\S]*\bfailed\b[.!?]*$/i.test(normalized);
 }
 
@@ -2701,13 +3634,44 @@ function resolveWechatContextChatType(
     return undefined;
 }
 
+function resolveWechatContextChannelAlias(ctx: Record<string, unknown> | undefined): "wechat" | undefined {
+    for (const key of [
+        "channel",
+        "Channel",
+        "agentChannel",
+        "AgentChannel",
+        "currentChannelProvider",
+        "CurrentChannelProvider",
+        "OriginatingChannel",
+        "Provider",
+        "Surface",
+    ]) {
+        const canonical = canonicalWechatChannelId(ctx?.[key]);
+        if (canonical) {
+            return canonical;
+        }
+    }
+    return undefined;
+}
+
 function normalizeWechatMessageToolTarget(value: unknown): string {
     let normalized = typeof value === "string" ? value.trim() : "";
     if (!normalized) {
         return "";
     }
 
-    const removablePrefixes = new Set(["wechat", "channel", "group", "chat", "user", "direct", "dm"]);
+    const removablePrefixes = new Set([
+        "wechat",
+        "weixin",
+        "openclaw-weixin",
+        "wechatid",
+        "channel",
+        "group",
+        "chat",
+        "user",
+        "direct",
+        "dm",
+    ]);
     for (let index = 0; index < 4; index += 1) {
         const separatorIndex = normalized.indexOf(":");
         if (separatorIndex <= 0) {
@@ -2763,11 +3727,75 @@ function hasWechatMessageToolMediaIntent(params: Record<string, unknown>): boole
     return false;
 }
 
+function hasWechatMessageToolTextIntent(params: Record<string, unknown>): boolean {
+    for (const field of ["message", "text", "content", "caption"] as const) {
+        const value = params[field];
+        if (typeof value === "string" && value.trim()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function patchWechatMessageToolChannelField(params: Record<string, unknown>): {
+    changed: boolean;
+    previousChannel?: string;
+    target?: string;
+    reason?: string;
+} {
+    const rawChannel = typeof params.channel === "string" ? params.channel.trim() : "";
+    if (!rawChannel) {
+        params.channel = "wechat";
+        return {
+            changed: true,
+            previousChannel: rawChannel,
+            reason: "missing-channel",
+        };
+    }
+
+    const channelTargetMatch = rawChannel.match(/^(?:wechatId|wechat|weixin|openclaw-weixin)\s*:\s*(.+)$/i);
+    const targetCandidate = channelTargetMatch?.[1]?.trim();
+    if (targetCandidate && (
+        targetCandidate.endsWith("@chatroom") ||
+        targetCandidate.startsWith("wxid_") ||
+        /^\d{5,}$/.test(targetCandidate)
+    )) {
+        params.channel = "wechat";
+        if (!resolveWechatMessageToolTargetField(params).value) {
+            params.target = targetCandidate;
+        }
+        return {
+            changed: true,
+            previousChannel: rawChannel,
+            target: targetCandidate,
+            reason: "channel-carried-target",
+        };
+    }
+
+    if (rawChannel === "openclaw-weixin" || rawChannel === "weixin") {
+        params.channel = "wechat";
+        return {
+            changed: true,
+            previousChannel: rawChannel,
+            reason: "legacy-channel-alias",
+        };
+    }
+
+    return {
+        changed: false,
+    };
+}
+
 function buildWechatMessageToolGroupTargetPatch(params: {
     rawParams: Record<string, unknown>;
     ctx: Record<string, unknown> | undefined;
     sessionKey?: string;
     senderId?: string;
+    authContext?: {
+        from?: string;
+        chatType?: "group" | "direct";
+        senderId?: string;
+    };
 }): {
     target: string;
     previousTarget?: string;
@@ -2780,12 +3808,14 @@ function buildWechatMessageToolGroupTargetPatch(params: {
         return null;
     }
 
-    if (resolveWechatContextChatType(params.ctx, params.sessionKey) !== "group") {
+    const chatType = resolveWechatContextChatType(params.ctx, params.sessionKey) || params.authContext?.chatType;
+    if (chatType !== "group" && chatType !== "direct") {
         return null;
     }
 
     const groupTarget =
         readWechatContextString(params.ctx, ["from", "From", "OriginatingTo", "threadId", "ThreadId", "MessageThreadId"]) ||
+        params.authContext?.from ||
         resolveWechatContextChatIdFromSessionKey(params.sessionKey);
     if (!groupTarget) {
         return null;
@@ -2795,8 +3825,12 @@ function buildWechatMessageToolGroupTargetPatch(params: {
     if (!targetField.value) {
         return {
             target: groupTarget,
-            reason: "missing-target",
+            reason: chatType === "group" ? "missing-target" : "missing-direct-target",
         };
+    }
+
+    if (chatType === "direct") {
+        return null;
     }
 
     const normalizedTarget = (targetField.normalized || "").trim();
@@ -2809,7 +3843,7 @@ function buildWechatMessageToolGroupTargetPatch(params: {
         return null;
     }
 
-    const senderId = params.senderId?.trim().toLowerCase() || "";
+    const senderId = params.senderId?.trim().toLowerCase() || params.authContext?.senderId?.trim().toLowerCase() || "";
     if (senderId && normalizedLower === senderId) {
         return {
             target: groupTarget,
@@ -2968,6 +4002,14 @@ function attachBridgeClientSocketHandlers(api: OpenClawPluginApi, socket: WebSoc
     setActiveBridgeSocket(socket);
     markBridgePong();
 
+    socket.on("pong", () => {
+        markBridgePong();
+    });
+
+    socket.on("ping", () => {
+        markBridgePong();
+    });
+
     socket.on("message", async (raw) => {
         try {
             const text = raw.toString();
@@ -2993,12 +4035,15 @@ function attachBridgeClientSocketHandlers(api: OpenClawPluginApi, socket: WebSoc
 
     socket.on("close", (code) => {
         const state = getGlobalState();
-        if (getActiveBridgeSocket() === socket) {
+        const wasActiveSocket = getActiveBridgeSocket() === socket;
+        if (wasActiveSocket) {
             setActiveBridgeSocket(null);
+            state.clientConnecting = false;
+            api.logger.warn(`[WeChat] Bridge WS disconnected code=${code}`);
+            scheduleBridgeClientReconnect(api, "socket-close");
+            return;
         }
-        state.clientConnecting = false;
-        api.logger.warn(`[WeChat] Bridge WS disconnected code=${code}`);
-        scheduleBridgeClientReconnect(api, "socket-close");
+        api.logger.debug?.(`[WeChat] Ignoring stale bridge socket close code=${code}`);
     });
 
     socket.on("error", (err: any) => {
@@ -3032,7 +4077,11 @@ function installBridgeHeartbeat(api: OpenClawPluginApi, state = getGlobalState()
             socket.close(1001, "heartbeat timeout");
             return;
         }
-        socket.send(JSON.stringify(buildFrame("openclaw_to_bridge", "ping")));
+        try {
+            socket.ping();
+        } catch (err: any) {
+            api.logger.warn(`[WeChat] Bridge heartbeat ping failed: ${err?.message || err}`);
+        }
     }, 30000);
 
     state.heartbeatTimer = bridgeHeartbeatTimer;
@@ -3043,7 +4092,8 @@ function buildWechatBridgeServerUrl(wsConfig: WechatBridgeWsConfig): string {
 }
 
 function scheduleBridgeClientReconnect(api: OpenClawPluginApi, reason: string) {
-    if (bridgeClientReconnectTimer || bridgeClosePromise) {
+    const state = getGlobalState();
+    if (bridgeClientReconnectTimer || bridgeClosePromise || hasActiveBridgeClient(state)) {
         return;
     }
     api.logger.info(`[WeChat] Scheduling bridge reconnect (${reason})`);
@@ -3515,6 +4565,16 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         },
     };
 
+    await recordWechatInboundSessionRoute({
+        api,
+        cfg: cfg as Record<string, unknown>,
+        sessionKey,
+        ctx,
+        to: from,
+        accountId: accountId || "default",
+        threadId: sessionChatKey,
+    });
+
     if (chatType === "direct") {
         void refreshWechatDirectSessionDisplayName({
             api,
@@ -3586,6 +4646,8 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
 
     let cumulativeSentText = "";
     let turnTextSeen = "";
+    let sawFinalErrorPayload = false;
+    let finalErrorPayloadSummary = "";
     let bufferedFinalReply: { args: any[] } | null = null;
     let bufferedFinalReplyCount = 0;
     let flushingBufferedFinalReply = false;
@@ -3744,6 +4806,33 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
                 // OpenClaw dispatcher arguments order: (payload, info)
                 const payload = (typeof args[0] === 'object' && args[0] !== null) ? args[0] : {};
                 const info = (args.length > 1 && typeof args[1] === 'object') ? args[1] : {};
+                if (info.kind === "final" && payload?.isError === true) {
+                    sawFinalErrorPayload = true;
+                    const errorText = typeof payload.text === "string"
+                        ? payload.text
+                        : (
+                            typeof payload.message === "string"
+                                ? payload.message
+                                : (
+                                    typeof payload.content === "string"
+                                        ? payload.content
+                                        : ""
+                                )
+                        );
+                    finalErrorPayloadSummary = summarizeWechatTextForLog(errorText || "final-error-payload", 120);
+                    const finalErrorSuppression = shouldSuppressWechatToolFailureSummary({
+                        payload,
+                        text: errorText,
+                        cumulativeSentText,
+                    });
+                    if (finalErrorSuppression.matched) {
+                        api.logger.warn?.(
+                            `[WeChat] Suppressing final error payload reason=${finalErrorSuppression.reason} ` +
+                            `session=${sessionKey} error="${finalErrorPayloadSummary}"`,
+                        );
+                        return;
+                    }
+                }
                 if (info.kind === "final" && !flushingBufferedFinalReply) {
                     bufferedFinalReply = {
                         args: args.map((arg) => {
@@ -4140,7 +5229,13 @@ async function handleInboundMessage(api: OpenClawPluginApi, body: any) {
         const blockedReply = typeof sessionKey === "string"
             ? getWechatBlockedReplyForSession(sessionKey)
             : undefined;
-        if (!internalCheck.matched && !hasNoReply) {
+        if (sawFinalErrorPayload) {
+            api.logger.warn?.(
+                `[WeChat] Suppressing fallback partial text because final error payload was observed ` +
+                `session=${sessionKey} error="${finalErrorPayloadSummary}" ` +
+                `partial="${summarizeWechatTextForLog(finalUnseenText, 120)}"`,
+            );
+        } else if (!internalCheck.matched && !hasNoReply) {
             api.logger.info(
                 `[WeChat] Fallback: deliver never sent text but onPartialReply captured content, sending now ` +
                 `session=${sessionKey} textLen=${finalUnseenText.length} text="${summarizeWechatTextForLog(finalUnseenText, 120)}"`,
@@ -4324,7 +5419,7 @@ const plugin = {
                 }
 
                 return;
-            }, { priority: 100 });
+            }, { priority: 10_000 });
 
             api.on("before_model_resolve", (_event, ctx) => {
                 tryBindWechatToolAuthForRun({
@@ -4332,7 +5427,7 @@ const plugin = {
                     hookName: "before_model_resolve",
                 });
                 return;
-            }, { priority: 100 });
+            }, { priority: 10_000 });
 
             api.on("before_prompt_build", (_event, ctx) => {
                 tryBindWechatToolAuthForRun({
@@ -4340,7 +5435,7 @@ const plugin = {
                     hookName: "before_prompt_build",
                 });
                 return;
-            }, { priority: 100 });
+            }, { priority: 10_000 });
 
             api.on("before_agent_start", (_event, ctx) => {
                 tryBindWechatToolAuthForRun({
@@ -4361,24 +5456,57 @@ const plugin = {
                 const toolSpecificBypassWxids = getWechatToolSpecificAllowList(bridgeConfig, toolName);
                 const effectiveRunId = ctx.runId?.trim() || event.runId?.trim();
                 const effectiveSessionKey = resolveWechatContextSessionKey(ctx as Record<string, unknown>);
+                const preliminaryRunAuth = effectiveRunId ? getWechatToolAuthForRun(effectiveRunId) : undefined;
+                const preliminarySessionAuth = effectiveSessionKey ? getWechatToolAuthForSession(effectiveSessionKey) : undefined;
+                const preliminaryFallbackAuth = effectiveSessionKey ? getWechatToolAuthFallbackForSession(effectiveSessionKey) : undefined;
+                const preliminaryContextAuth = effectiveSessionKey
+                    ? buildWechatToolAuthFromContext({
+                        ctx: ctx as Record<string, unknown>,
+                        sessionKey: effectiveSessionKey,
+                        senderId: resolveWechatContextSenderId(ctx as Record<string, unknown>, event.senderId),
+                        content: resolveWechatContextBody(ctx as Record<string, unknown>, event.body || event.content),
+                    })
+                    : undefined;
+                const preliminaryWechatAuth =
+                    preliminaryRunAuth ||
+                    preliminarySessionAuth ||
+                    preliminaryFallbackAuth ||
+                    preliminaryContextAuth;
+                const hasWechatMessageContext = Boolean(
+                    effectiveSessionKey?.includes(":wechat:") ||
+                    preliminaryWechatAuth ||
+                    resolveWechatContextChannelAlias(ctx as Record<string, unknown>) ||
+                    (event.params && typeof event.params === "object" && canonicalWechatChannelId((event.params as Record<string, unknown>).channel)),
+                );
+                if (effectiveSessionKey && (effectiveSessionKey.includes(":wechat:") || preliminaryWechatAuth)) {
+                    void canonicalizeWechatSessionStoreRouteForConfig({
+                        api,
+                        cfg: cfg as Record<string, unknown>,
+                        sessionKey: effectiveSessionKey,
+                        reason: "before_tool_call",
+                        force: Boolean(preliminaryWechatAuth),
+                    });
+                }
 
                 // [Auto-inject channel/target] 当 AI 在 WeChat 会话中调用 message 工具但未指定 channel 时，
                 // 自动注入 channel: "wechat"，防止多渠道配置下的 "Channel is required" 错误。
                 // 群聊里发媒体时也固定回当前群，避免模型把 senderId/wxid 当成目标后把图私发给发起人。
                 if (
                     toolName === "message" &&
-                    effectiveSessionKey &&
-                    effectiveSessionKey.includes(":wechat:") &&
+                    hasWechatMessageContext &&
                     event.params &&
                     typeof event.params === "object"
                 ) {
                     const nextParams = { ...(event.params as Record<string, unknown>) };
                     let changed = false;
-                    if (!nextParams.channel) {
-                        nextParams.channel = "wechat";
+                    const channelPatch = patchWechatMessageToolChannelField(nextParams);
+                    if (channelPatch.changed) {
                         changed = true;
                         api.logger.info(
-                            `[WeChat] Auto-injecting channel=wechat for message tool call session=${effectiveSessionKey}`,
+                            `[WeChat] Auto-normalized message tool channel=wechat session=${effectiveSessionKey}` +
+                            `${channelPatch.previousChannel ? ` previous=${channelPatch.previousChannel}` : ""}` +
+                            `${channelPatch.target ? ` target=${channelPatch.target}` : ""}` +
+                            `${channelPatch.reason ? ` reason=${channelPatch.reason}` : ""}`,
                         );
                     }
 
@@ -4387,6 +5515,13 @@ const plugin = {
                         ctx: ctx as Record<string, unknown>,
                         sessionKey: effectiveSessionKey,
                         senderId: resolveWechatContextSenderId(ctx as Record<string, unknown>, event.senderId),
+                        authContext: preliminaryWechatAuth
+                            ? {
+                                from: preliminaryWechatAuth.from,
+                                chatType: preliminaryWechatAuth.chatType,
+                                senderId: preliminaryWechatAuth.senderId,
+                            }
+                            : undefined,
                     });
                     if (groupTargetPatch) {
                         nextParams.target = groupTargetPatch.target;
@@ -4394,10 +5529,28 @@ const plugin = {
                         delete nextParams.channelId;
                         changed = true;
                         api.logger.info(
-                            `[WeChat] Auto-routing message tool to current group session=${effectiveSessionKey} ` +
+                            `[WeChat] Auto-routing message tool to current conversation session=${effectiveSessionKey || ""} ` +
                             `target=${groupTargetPatch.target} reason=${groupTargetPatch.reason}` +
                             `${groupTargetPatch.previousTarget ? ` previous=${groupTargetPatch.previousTarget}` : ""}`,
                         );
+                    }
+
+                    const action = typeof nextParams.action === "string"
+                        ? nextParams.action.trim().toLowerCase()
+                        : "";
+                    if (
+                        (!action || action === "send") &&
+                        !hasWechatMessageToolTextIntent(nextParams) &&
+                        !hasWechatMessageToolMediaIntent(nextParams)
+                    ) {
+                        api.logger.info(
+                            `[WeChat] Blocking empty message tool call session=${effectiveSessionKey} ` +
+                            `paramKeys=${Object.keys(nextParams).join(",")}`,
+                        );
+                        return {
+                            block: true,
+                            blockReason: "NO_REPLY",
+                        };
                     }
 
                     if (changed) {
@@ -4671,6 +5824,7 @@ const plugin = {
                     const safeReadonlyExecMatch = resolveWechatSafeReadonlyExecCommandMatch(
                         execCommand,
                         execWorkdir,
+                        resolveWechatSafeReadonlyExecRoots(bridgeConfig),
                     );
                     if (safeReadonlyExecMatch.matched) {
                         api.logger.info(
@@ -4951,7 +6105,7 @@ const plugin = {
                 }
 
                 return;
-            }, { priority: 100 });
+            }, { priority: 10_000 });
 
             api.on("after_tool_call", (event, ctx) => {
                 if (!ctx.runId) {
@@ -5037,7 +6191,123 @@ const plugin = {
                 }
             }, { priority: 100 });
 
-            api.on("subagent_spawned", (_event, ctx) => {
+            api.on("subagent_spawning", async (event, ctx) => {
+                canonicalizeWechatGlobalChannelRegistry(api, "subagent_spawning");
+                const requesterSessionKey = resolveWechatContextSessionKey({
+                    sessionKey: ctx.requesterSessionKey,
+                    SessionKey: (ctx as Record<string, unknown>).RequesterSessionKey,
+                });
+                const normalized = normalizeWechatSubagentDeliveryOrigin({
+                    origin: event.requester,
+                    requesterSessionKey,
+                });
+                const cfg = api.runtime.config.current();
+                await Promise.all([
+                    canonicalizeWechatCoreRuntimeChannelRegistries(api, "subagent_spawning"),
+                    canonicalizeWechatSessionStoreRouteForConfig({
+                        api,
+                        cfg: cfg as Record<string, unknown>,
+                        sessionKey: requesterSessionKey,
+                        reason: "subagent_spawning",
+                        force: Boolean(normalized),
+                    }),
+                    canonicalizeWechatActiveSubagentRuntimeOrigins({
+                        api,
+                        childSessionKey: event.childSessionKey,
+                        requesterSessionKey,
+                        reason: "subagent_spawning",
+                    }),
+                    canonicalizeWechatSubagentRegistryOrigins({
+                        api,
+                        childRunId: ctx.runId,
+                        requesterSessionKey,
+                        reason: "subagent_spawning",
+                    }),
+                ]);
+                if (!normalized) {
+                    return;
+                }
+                if (event.requester && typeof event.requester === "object") {
+                    event.requester.channel = normalized.origin.channel;
+                    event.requester.accountId = normalized.origin.accountId;
+                    event.requester.to = normalized.origin.to;
+                    if (normalized.origin.threadId != null) {
+                        event.requester.threadId = normalized.origin.threadId;
+                    }
+                }
+                if (normalized.changed) {
+                    const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
+                    api.logger.info(
+                        `[WeChat] Canonicalized subagent spawning origin child=${event.childSessionKey || ""}` +
+                        ` requester=${requesterSessionKey || ""}` +
+                        ` channel=${normalized.previousChannel || "missing"}->wechat` +
+                        ` to=${redactWechatTextForLogs(summarizeWechatTextForLog(normalized.origin.to || "", 120), bridgeConfig)}` +
+                        `${normalized.inferredFromSession ? " source=session-key" : ""}`,
+                    );
+                }
+                return {
+                    status: "ok" as const,
+                    deliveryOrigin: normalized.origin,
+                };
+            }, { priority: 10_000 });
+
+            api.on("subagent_delivery_target", async (event, ctx) => {
+                canonicalizeWechatGlobalChannelRegistry(api, "subagent_delivery_target");
+                const normalized = normalizeWechatSubagentDeliveryOrigin({
+                    origin: event.requesterOrigin,
+                    requesterSessionKey: event.requesterSessionKey,
+                });
+                const cfg = api.runtime.config.current();
+                await Promise.all([
+                    canonicalizeWechatCoreRuntimeChannelRegistries(api, "subagent_delivery_target"),
+                    canonicalizeWechatSessionStoreRouteForConfig({
+                        api,
+                        cfg: cfg as Record<string, unknown>,
+                        sessionKey: event.requesterSessionKey,
+                        reason: "subagent_delivery_target",
+                    }),
+                    canonicalizeWechatSubagentRegistryOrigins({
+                        api,
+                        childRunId: event.childRunId || ctx.runId,
+                        requesterSessionKey: event.requesterSessionKey,
+                        reason: "subagent_delivery_target",
+                    }),
+                    canonicalizeWechatActiveSubagentRuntimeOrigins({
+                        api,
+                        childRunId: event.childRunId || ctx.runId,
+                        childSessionKey: event.childSessionKey,
+                        requesterSessionKey: event.requesterSessionKey,
+                        reason: "subagent_delivery_target",
+                    }),
+                ]);
+                if (!normalized) {
+                    return;
+                }
+                if (event.requesterOrigin && typeof event.requesterOrigin === "object") {
+                    event.requesterOrigin.channel = normalized.origin.channel;
+                    event.requesterOrigin.accountId = normalized.origin.accountId;
+                    event.requesterOrigin.to = normalized.origin.to;
+                    if (normalized.origin.threadId != null) {
+                        event.requesterOrigin.threadId = normalized.origin.threadId;
+                    }
+                }
+                if (normalized.changed) {
+                    const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
+                    api.logger.info(
+                        `[WeChat] Canonicalized subagent delivery target runId=${ctx.runId || event.childRunId || ""}` +
+                        ` requester=${event.requesterSessionKey}` +
+                        ` channel=${normalized.previousChannel || "missing"}->wechat` +
+                        ` to=${redactWechatTextForLogs(summarizeWechatTextForLog(normalized.origin.to || "", 120), bridgeConfig)}` +
+                        `${normalized.inferredFromSession ? " source=session-key" : ""}`,
+                    );
+                }
+                return {
+                    origin: normalized.origin,
+                };
+            }, { priority: 10_000 });
+
+            api.on("subagent_spawned", async (event, ctx) => {
+                canonicalizeWechatGlobalChannelRegistry(api, "subagent_spawned");
                 const requesterSessionKey = resolveWechatContextSessionKey({
                     sessionKey: ctx.requesterSessionKey,
                     SessionKey: (ctx as Record<string, unknown>).RequesterSessionKey,
@@ -5049,11 +6319,41 @@ const plugin = {
                 if (!childSessionKey || !requesterSessionKey) {
                     return;
                 }
+                const cfg = api.runtime.config.current();
+                await Promise.all([
+                    canonicalizeWechatCoreRuntimeChannelRegistries(api, "subagent_spawned"),
+                    canonicalizeWechatSessionStoreRouteForConfig({
+                        api,
+                        cfg: cfg as Record<string, unknown>,
+                        sessionKey: requesterSessionKey,
+                        reason: "subagent_spawned:requester",
+                    }),
+                    canonicalizeWechatSessionStoreRouteForConfig({
+                        api,
+                        cfg: cfg as Record<string, unknown>,
+                        sessionKey: childSessionKey,
+                        reason: "subagent_spawned:child",
+                        force: true,
+                    }),
+                    canonicalizeWechatSubagentRegistryOrigins({
+                        api,
+                        childRunId: event.runId || ctx.runId,
+                        requesterSessionKey,
+                        reason: "subagent_spawned",
+                    }),
+                    canonicalizeWechatActiveSubagentRuntimeOrigins({
+                        api,
+                        childRunId: event.runId || ctx.runId,
+                        childSessionKey,
+                        requesterSessionKey,
+                        reason: "subagent_spawned",
+                    }),
+                ]);
                 inheritWechatToolAuthForChildSession({
                     requesterSessionKey,
                     childSessionKey,
                 });
-            }, { priority: 100 });
+            }, { priority: 10_000 });
 
             api.on("session_end", (_event, ctx) => {
                 const sessionKey = resolveWechatContextSessionKey(ctx as Record<string, unknown>);
@@ -5067,6 +6367,8 @@ const plugin = {
             logBridgeState(api, "register:init", sharedState);
 
             api.registerChannel({ plugin: wechatPlugin });
+            canonicalizeWechatGlobalChannelRegistry(api, "register");
+            void canonicalizeWechatCoreRuntimeChannelRegistries(api, "register");
         }
     },
     unregister(api: OpenClawPluginApi) {
