@@ -9,6 +9,7 @@ import {
     type ClaimWechatToolAuthLogDedup,
 } from "./tool-auth-missing-context.js";
 import {
+    buildWechatDeniedToolAuthModelReason,
     logWechatInstalledSkillDebugIfNeeded,
     maybeBypassWechatSafeReadonlyExec,
     maybeHandleWechatTrustedToolBypass,
@@ -27,6 +28,7 @@ import {
     normalizeGuardedToolNameList,
     normalizeWechatIdAllowList,
     normalizeWechatSkillIdList,
+    resolveWechatMcporterExecBypass,
     resolveWechatSafeDownloadExecBypass,
     resolveWechatSystemSafePathBypass,
     resolveWechatToolBypassMatch,
@@ -152,7 +154,9 @@ function buildWechatPermissionPromptContext(params: {
         "[OpenClaw WeChat permission context]",
         `Current WeChat sender ${senderLabel} in ${location} is not the owner and is not in the tool/file bypass allowlist.`,
         "Do not claim that a blocked action succeeded.",
-        "This sender is not allowed to receive local host files or generated local file attachments from OpenClaw. If the user asks you to send/attach/upload a local file, explain in the user's language that you cannot send the file because the current WeChat source lacks permission; offer to summarize the content or ask the owner to initiate the request.",
+        "Do not preemptively refuse image or media generation just because the result is stored as a local file; common safe media attachments such as images can be delivered after the channel's delivery checks pass.",
+        `When you need to download a remote/generated media URL for WeChat delivery, use the safe download form wget -O ${bridgeConfig.workspaceBase}/downloads/<filename> <url> or curl -L -o ${bridgeConfig.workspaceBase}/downloads/<filename> <url>; do not use python -c, inline scripts, or general shell pipelines for downloads.`,
+        "If a guarded tool call or local attachment delivery is actually blocked by the system, explain the permission policy in the user's language instead of retrying or pretending it succeeded. For non-media local host files, offer to summarize the content or ask the owner to initiate the request.",
     ];
     if (bridgeConfig.nonOwnerToolAuthMode !== "off" && guardedTools.length > 0) {
         lines.push(
@@ -497,6 +501,24 @@ export function registerWechatToolAuthBeforeHooks(params: {
             };
         }
 
+        const mcporterBypass = resolveWechatMcporterExecBypass({
+            toolName,
+            command: execCommand,
+            allowMcporterExec: bridgeConfig.toolAuthAllowMcporterExec,
+        });
+        if (mcporterBypass.matched) {
+            api.logger.info(
+                `[WeChat ToolAuth] MCP CLI bypass tool=exec command=mcporter ` +
+                `segment="${summarizeWechatTextForLog(mcporterBypass.normalized || execCommand || "", 120)}" ${authSummary}`,
+            );
+            return {
+                params: {
+                    ...(event.params && typeof event.params === "object" ? event.params as Record<string, unknown> : {}),
+                    ask: "off",
+                },
+            };
+        }
+
         if (bridgeConfig.nonOwnerToolAuthMode === "deny") {
             return handleWechatDeniedToolAuth({
                 api,
@@ -506,6 +528,11 @@ export function registerWechatToolAuthBeforeHooks(params: {
                 effectiveSessionKey,
                 authSummary,
                 authContext,
+                modelReason: buildWechatDeniedToolAuthModelReason({
+                    toolName,
+                    bridgeConfig,
+                    state: installedSkillState,
+                }),
                 claimWechatToolAuthLogDedup,
                 sendWechatToolAuthNotice,
             });

@@ -32,9 +32,23 @@
 ## 目录说明
 
 - `index.ts`
-  扩展主入口，Bridge 客户端连接、微信入站处理、工具权限控制都在这里
+  扩展主入口，负责插件注册、启动/停止编排和各子模块挂接
+- `src/bridge-runtime.ts` / `src/bridge-autostart.ts`
+  Bridge WebSocket 连接、心跳、重连和自动启动相关逻辑
+- `src/inbound-handler.ts` / `src/inbound-context.ts`
+  微信入站消息解析、会话上下文和 OpenClaw 投递
 - `src/channel.ts`
-  `wechat` channel 的 outbound 定义，负责把 OpenClaw 的发送动作转成 Bridge 帧
+  `wechat` channel 的插件定义、会话路由和 action/outbound 挂接
+- `src/outbound-send.ts`
+  文本 / 媒体出站发送，包含本地媒体路径解析、暂存、去重和 Bridge 帧发送
+- `src/reply-delivery.ts`
+  模型回复分段、最终回复缓冲、媒体候选提取和回发编排
+- `src/message-tool.ts`
+  `message` 工具参数规范化和 WeChat 目标解析
+- `src/tool-auth-*.ts` / `src/installed-skill-*.ts`
+  微信发送者敏感工具权限、已安装 skill 自动放行和只读 exec 白名单识别
+- `src/canonicalization*.ts`
+  WeChat 通道名、会话路由、subagent delivery origin 的兼容规范化
 - `src/config.ts`
   本地配置读取、默认值处理、媒体根目录解析
 - `src/runtime.ts`
@@ -86,6 +100,7 @@ ws_path = "/ws"
 - 入站日志：`[WeChat Inbound] ...`
 - 出站日志：`[WeChat Outbound] ...`
 - 连接日志：`Bridge WS client connected` 或 `Connected to OpenClawBridge server`
+  也可能显示为：`Bridge WS connected: ws://...`
 
 ## 配置读取优先级
 
@@ -236,9 +251,70 @@ workspaceBase/downloads
 
 是否允许“已安装 skill”触发的敏感工具自动放行。
 
+### `toolAuthAllowMcporterExec`
+
+是否允许非主人执行 `mcporter` MCP CLI 命令。
+
+开启后会放行 `mcporter ...` 和常见的 `npx mcporter ...` 形式，包括 `list` / `call` / `auth` / `config` / `daemon` 等子命令。
+
+仍会拒绝夹带 shell 拼接的命令，例如 `;`、`|`、重定向、命令替换、环境变量展开等。
+
 ### `toolAuthBlockedSkills`
 
 skill 黑名单。
+
+### `toolAuthAllowSafeReadonlyExec`
+
+是否允许非主人执行极少数只读低风险 `exec` 命令。
+
+当前只识别固定安全形态，例如：
+
+- `date`
+- `pwd`
+- `whoami`
+- `hostname`
+- `uname`
+- `id`
+- `arch`
+- 针对受控目录的 `ls` / `stat` / `readlink`
+- 安全只读查询后接一个简单 `head` 截断，例如 `ls -lt <受控目录> | head -n 5`
+
+除上述 `head` 截断特例外，带管道、重定向、命令替换、`;`、`&&`、`||` 等 shell 组合的命令不会放行。
+
+远端媒体下载另有一个收窄的安全下载 bypass：只允许 `wget -O <workspace 路径> <http(s) URL>` 或 `curl -L -o <workspace 路径> <http(s) URL>` 这类输出路径落在 workspace 内的命令。
+
+### `toolAuthDebugInstalledSkills`
+
+是否输出“已安装 skill 自动放行”的调试日志。
+
+排查某条 `exec` / `process` 为什么没有被识别为 skill 调用时，可以临时打开。
+
+### 工具权限通知文案
+
+这些开关控制非主人触发敏感工具时，是否向微信回发提示：
+
+- `toolAuthNotifyBlocked`
+- `toolAuthNotifyApprovalQueued`
+- `toolAuthNotifyApprovalResolved`
+- `toolAuthNotifyInGroup`
+- `toolAuthNotifyInDirect`
+
+这些字段可以覆盖默认提示模板：
+
+- `toolAuthMessageBlocked`
+- `toolAuthMessageQueued`
+- `toolAuthMessageAllowOnce`
+- `toolAuthMessageAllowAlways`
+- `toolAuthMessageDeny`
+- `toolAuthMessageTimeout`
+- `toolAuthMessageCancelled`
+
+模板支持占位符：
+
+```text
+{{toolName}} {{state}} {{stateLabel}} {{senderId}} {{senderName}} {{skillId}}
+{{from}} {{chatType}} {{chatTypeLabel}} {{conversationLabel}} {{question}}
+```
 
 ## 推荐配置示例
 
@@ -255,7 +331,9 @@ skill 黑名单。
   "tmpDir": "",
   "mediaSearchPaths": [],
   "nonOwnerToolAuthMode": "deny",
-  "nonOwnerToolAuthTools": ["exec", "process"]
+  "nonOwnerToolAuthTools": ["exec", "process"],
+  "toolAuthAllowInstalledSkills": false,
+  "toolAuthAllowSafeReadonlyExec": false
 }
 ```
 
@@ -272,7 +350,9 @@ skill 黑名单。
   "tmpDir": "/home/rs/.openclaw/workspace/downloads",
   "mediaSearchPaths": [],
   "nonOwnerToolAuthMode": "approve",
-  "nonOwnerToolAuthTools": ["exec", "process"]
+  "nonOwnerToolAuthTools": ["exec", "process"],
+  "toolAuthAllowInstalledSkills": false,
+  "toolAuthAllowSafeReadonlyExec": false
 }
 ```
 

@@ -21,6 +21,7 @@ type PartialWechatExtensionConfig = {
     toolAuthBypassByTool?: Record<string, string[]>;
     toolAuthBlockedSkills?: string[];
     toolAuthAllowInstalledSkills?: boolean;
+    toolAuthAllowMcporterExec?: boolean;
     toolAuthAllowSafeReadonlyExec?: boolean;
     toolAuthDebugInstalledSkills?: boolean;
     ownerExecBypassApproval?: boolean;
@@ -56,6 +57,7 @@ export type WechatExtensionConfig = {
     toolAuthBypassByTool: Record<string, string[]>;
     toolAuthBlockedSkills: string[];
     toolAuthAllowInstalledSkills: boolean;
+    toolAuthAllowMcporterExec: boolean;
     toolAuthAllowSafeReadonlyExec: boolean;
     toolAuthDebugInstalledSkills: boolean;
     ownerExecBypassApproval: boolean;
@@ -176,6 +178,7 @@ function sanitizeLocalConfig(raw: unknown): PartialWechatExtensionConfig {
         toolAuthBypassByTool: normalizeToolAuthBypassByTool(source.toolAuthBypassByTool),
         toolAuthBlockedSkills: normalizeStringArray(source.toolAuthBlockedSkills),
         toolAuthAllowInstalledSkills: normalizeBoolean(source.toolAuthAllowInstalledSkills),
+        toolAuthAllowMcporterExec: normalizeBoolean(source.toolAuthAllowMcporterExec),
         toolAuthAllowSafeReadonlyExec: normalizeBoolean(source.toolAuthAllowSafeReadonlyExec),
         toolAuthDebugInstalledSkills: normalizeBoolean(source.toolAuthDebugInstalledSkills),
         ownerExecBypassApproval: normalizeBoolean(source.ownerExecBypassApproval),
@@ -270,6 +273,10 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
         normalizeBoolean(root.toolAuthAllowInstalledSkills) ??
         local.toolAuthAllowInstalledSkills ??
         false;
+    const toolAuthAllowMcporterExec =
+        normalizeBoolean(root.toolAuthAllowMcporterExec) ??
+        local.toolAuthAllowMcporterExec ??
+        false;
     const toolAuthAllowSafeReadonlyExec =
         normalizeBoolean(root.toolAuthAllowSafeReadonlyExec) ??
         local.toolAuthAllowSafeReadonlyExec ??
@@ -351,6 +358,7 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
         toolAuthBypassByTool,
         toolAuthBlockedSkills,
         toolAuthAllowInstalledSkills,
+        toolAuthAllowMcporterExec,
         toolAuthAllowSafeReadonlyExec,
         toolAuthDebugInstalledSkills,
         ownerExecBypassApproval,

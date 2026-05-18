@@ -53,6 +53,10 @@ export const wechatChannelConfigSchema = {
                 type: "boolean",
                 description: "Allow guarded exec/process calls that match installed skill command patterns, even for non-owner senders",
             },
+            toolAuthAllowMcporterExec: {
+                type: "boolean",
+                description: "Allow non-owner WeChat senders to run mcporter MCP CLI exec commands after basic shell-composition checks",
+            },
             ownerExecBypassApproval: {
                 type: "boolean",
                 description: "Best-effort: force exec ask=off for owner WeChat senders before host exec policy runs",

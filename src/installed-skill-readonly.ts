@@ -168,6 +168,92 @@ function isWechatSafeReadonlyExecSegment(segment: string, params?: {
     return { matched: false };
 }
 
+function splitWechatSafeReadonlyHeadPipe(command: string): { source: string; head: string } | null {
+    let pipeIndex = -1;
+    let inSingle = false;
+    let inDouble = false;
+    let escaped = false;
+
+    for (let index = 0; index < command.length; index += 1) {
+        const ch = command[index];
+        const next = command[index + 1];
+
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (!inSingle && ch === "\\") {
+            escaped = true;
+            continue;
+        }
+        if (ch === "'" && !inDouble) {
+            inSingle = !inSingle;
+            continue;
+        }
+        if (ch === "\"" && !inSingle) {
+            inDouble = !inDouble;
+            continue;
+        }
+        if (inSingle || inDouble) {
+            continue;
+        }
+        if (ch !== "|") {
+            continue;
+        }
+        if (next === "|" || pipeIndex >= 0) {
+            return null;
+        }
+        pipeIndex = index;
+    }
+
+    if (pipeIndex < 0) {
+        return null;
+    }
+
+    const source = command.slice(0, pipeIndex).trim();
+    const head = command.slice(pipeIndex + 1).trim();
+    return source && head ? { source, head } : null;
+}
+
+function parseWechatHeadLineCount(value: string): number | null {
+    const trimmed = value.trim();
+    const match = trimmed.match(/^\+?(\d{1,3})$/);
+    if (!match) {
+        return null;
+    }
+    const count = Number(match[1]);
+    return Number.isInteger(count) && count >= 1 && count <= 200 ? count : null;
+}
+
+function isWechatSafeReadonlyHeadSegment(segment: string): boolean {
+    const tokens = splitWechatShellTokens(segment);
+    if (tokens.length === 0 || normalizeWechatExecutableBase(tokens[0]) !== "head") {
+        return false;
+    }
+
+    const args = tokens.slice(1).map((token) => unquoteWechatShellToken(token).trim());
+    if (args.some((arg) => !arg || WECHAT_SAFE_READONLY_EXEC_SHELL_META_RE.test(arg))) {
+        return false;
+    }
+    if (args.length === 0) {
+        return true;
+    }
+    if (args.length === 1) {
+        const arg = args[0];
+        if (/^--lines=/.test(arg)) {
+            return parseWechatHeadLineCount(arg.slice("--lines=".length)) !== null;
+        }
+        if (/^-n\d{1,3}$/.test(arg)) {
+            return parseWechatHeadLineCount(arg.slice(2)) !== null;
+        }
+        if (/^-\d{1,3}$/.test(arg)) {
+            return parseWechatHeadLineCount(arg.slice(1)) !== null;
+        }
+        return false;
+    }
+    return args.length === 2 && args[0] === "-n" && parseWechatHeadLineCount(args[1]) !== null;
+}
+
 export function resolveWechatSafeReadonlyExecCommandMatch(command: string, workdir: string | undefined, safePathRoots?: string[]): {
     matched: boolean;
     command?: string;
@@ -179,7 +265,7 @@ export function resolveWechatSafeReadonlyExecCommandMatch(command: string, workd
     if (!trimmed) {
         return { matched: false, reason: "empty-command" };
     }
-    if (/[\r\n]/.test(trimmed) || WECHAT_SAFE_READONLY_EXEC_SHELL_META_RE.test(trimmed)) {
+    if (/[\r\n]/.test(trimmed)) {
         return { matched: false, reason: "shell-meta" };
     }
 
@@ -188,8 +274,35 @@ export function resolveWechatSafeReadonlyExecCommandMatch(command: string, workd
         return { matched: false, reason: "wrapper-not-allowed" };
     }
     const normalized = unwrapped.command.trim();
-    if (!normalized || /[\r\n]/.test(normalized) || WECHAT_SAFE_READONLY_EXEC_SHELL_META_RE.test(normalized)) {
+    if (!normalized || /[\r\n]/.test(normalized)) {
         return { matched: false, reason: "unsafe-unwrapped-command" };
+    }
+
+    const headPipe = splitWechatSafeReadonlyHeadPipe(normalized);
+    if (headPipe) {
+        if (
+            WECHAT_SAFE_READONLY_EXEC_SHELL_META_RE.test(headPipe.source) ||
+            WECHAT_SAFE_READONLY_EXEC_SHELL_META_RE.test(headPipe.head)
+        ) {
+            return { matched: false, reason: "shell-meta" };
+        }
+        const sourceMatch = isWechatSafeReadonlyExecSegment(headPipe.source, {
+            workdir: unwrapped.workdir || workdir,
+            safePathRoots,
+        });
+        if (!sourceMatch.matched || !isWechatSafeReadonlyHeadSegment(headPipe.head)) {
+            return { matched: false, reason: "not-allowlisted" };
+        }
+        return {
+            matched: true,
+            command: sourceMatch.command,
+            normalized,
+            wrappers: unwrapped.wrappers,
+        };
+    }
+
+    if (WECHAT_SAFE_READONLY_EXEC_SHELL_META_RE.test(normalized)) {
+        return { matched: false, reason: "shell-meta" };
     }
 
     const segments = splitWechatShellSegments(normalized);

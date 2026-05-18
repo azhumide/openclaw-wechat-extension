@@ -195,6 +195,7 @@ export function handleWechatDeniedToolAuth(params: {
         senderId?: string;
         [key: string]: unknown;
     };
+    modelReason?: string;
     claimWechatToolAuthLogDedup: ClaimWechatToolAuthLogDedup;
     sendWechatToolAuthNotice: SendWechatToolAuthNotice;
 }): {
@@ -235,9 +236,12 @@ export function handleWechatDeniedToolAuth(params: {
             noticeSent: sentBlockedNotice,
         });
     }
+    const modelReason = params.modelReason?.trim()
+        ? ` The blocked call was rejected because ${params.modelReason.trim()}.`
+        : "";
     return {
         block: true,
-        blockReason: `WeChat sender ${params.authContext.senderId || "unknown"} is not authorized to use ${params.toolName}. Please politely inform the user that they do not have permission.`,
+        blockReason: `WeChat sender ${params.authContext.senderId || "unknown"} is not authorized to use ${params.toolName}.${modelReason} Please politely explain this permission policy to the user; do not retry the blocked action or claim it succeeded.`,
     };
 }
 

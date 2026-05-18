@@ -218,6 +218,61 @@ export function logWechatInstalledSkillDebugIfNeeded(params: {
     }
 }
 
+function describeWechatSafeReadonlyDenyReason(reason?: string): string | undefined {
+    switch (reason) {
+        case "shell-meta":
+        case "unsafe-unwrapped-command":
+            return "the command uses shell control characters such as pipes, redirection, variable expansion, or command substitution";
+        case "multiple-segments":
+            return "the command contains multiple shell segments";
+        case "wrapper-not-allowed":
+            return "the command is wrapped in a shell or another interpreter";
+        case "not-allowlisted":
+            return "the command or target path is outside the safe readonly allowlist";
+        case "empty-command":
+            return "the command is empty";
+        default:
+            return undefined;
+    }
+}
+
+export function buildWechatDeniedToolAuthModelReason(params: {
+    toolName: string;
+    bridgeConfig: ReturnType<typeof resolveWechatExtensionConfig>;
+    state: WechatInstalledSkillAuthState;
+}): string | undefined {
+    if (params.toolName !== "exec" || !params.state.execCommand) {
+        return undefined;
+    }
+
+    const reasons: string[] = [];
+    if (params.bridgeConfig.toolAuthAllowSafeReadonlyExec) {
+        const safeReadonlyExecMatch = resolveWechatSafeReadonlyExecCommandMatch(
+            params.state.execCommand,
+            params.state.execWorkdir,
+            resolveWechatSafeReadonlyExecRoots(params.bridgeConfig),
+        );
+        if (!safeReadonlyExecMatch.matched) {
+            const safeReadonlyReason = describeWechatSafeReadonlyDenyReason(safeReadonlyExecMatch.reason);
+            reasons.push(
+                safeReadonlyReason
+                    ? `it is not eligible for the safe-readonly exec bypass because ${safeReadonlyReason}`
+                    : "it is not eligible for the safe-readonly exec bypass",
+            );
+        }
+    }
+
+    if (
+        params.bridgeConfig.toolAuthAllowInstalledSkills &&
+        params.state.shouldInspectInstalledSkill &&
+        !params.state.installedSkillMatch.matched
+    ) {
+        reasons.push("it did not match a trusted installed-skill command");
+    }
+
+    return reasons.join("; ") || undefined;
+}
+
 export function maybeHandleWechatTrustedToolBypass(params: {
     api: OpenClawPluginApi;
     toolName: string;

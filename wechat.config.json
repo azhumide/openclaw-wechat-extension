@@ -35,6 +35,7 @@
     "gitlab-helper"
   ],
   "toolAuthAllowInstalledSkills": true,
+  "toolAuthAllowMcporterExec": true,
   "toolAuthAllowSafeReadonlyExec": true,
   "toolAuthDebugInstalledSkills": true,
   "ownerExecBypassApproval": true,
