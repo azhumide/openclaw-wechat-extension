@@ -1,5 +1,10 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { canonicalWechatChannelId, canonicalizeWechatSessionStoreRouteForConfig } from "./canonicalization.js";
+import {
+    canonicalWechatChannelId,
+    canonicalizeWechatCoreRuntimeChannelRegistries,
+    canonicalizeWechatGlobalChannelRegistry,
+    canonicalizeWechatSessionStoreRouteForConfig,
+} from "./canonicalization.js";
 import type { resolveWechatExtensionConfig } from "./config.js";
 import {
     handleWechatApprovalToolAuth,
@@ -213,7 +218,7 @@ export function registerWechatToolAuthBeforeHooks(params: {
         return;
     }, { priority: 100 });
 
-    api.on("before_tool_call", (event, ctx) => {
+    api.on("before_tool_call", async (event, ctx) => {
         const cfg = api.runtime.config.current();
         const bridgeConfig = resolveConfig(cfg, api.logger);
         const guardedTools = normalizeGuardedToolNameList(bridgeConfig.nonOwnerToolAuthTools);
@@ -261,6 +266,8 @@ export function registerWechatToolAuthBeforeHooks(params: {
             event.params &&
             typeof event.params === "object"
         ) {
+            canonicalizeWechatGlobalChannelRegistry(api, "before_message_tool_call");
+            await canonicalizeWechatCoreRuntimeChannelRegistries(api, "before_message_tool_call");
             const normalizedMessageTool = normalizeWechatMessageToolCall({
                 rawParams: event.params as Record<string, unknown>,
                 ctx: ctx as Record<string, unknown>,
@@ -283,8 +290,15 @@ export function registerWechatToolAuthBeforeHooks(params: {
             }
 
             if (normalizedMessageTool.kind === "params") {
+                const rawParams = event.params as Record<string, unknown>;
+                for (const key of Object.keys(rawParams)) {
+                    if (!(key in normalizedMessageTool.params)) {
+                        delete rawParams[key];
+                    }
+                }
+                Object.assign(rawParams, normalizedMessageTool.params);
                 return {
-                    params: normalizedMessageTool.params,
+                    params: rawParams,
                 };
             }
         }
@@ -554,4 +568,55 @@ export function registerWechatToolAuthBeforeHooks(params: {
 
         return;
     }, { priority: 10_000 });
+
+    api.on("before_tool_call", async (event, ctx) => {
+        const toolName = event.toolName.trim().toLowerCase();
+        if (
+            toolName !== "message" ||
+            !event.params ||
+            typeof event.params !== "object"
+        ) {
+            return;
+        }
+
+        const effectiveSessionKey = resolveWechatContextSessionKey(ctx as Record<string, unknown>);
+        const hasWechatMessageContext = Boolean(
+            effectiveSessionKey?.includes(":wechat:") ||
+            resolveWechatContextChannelAlias(ctx as Record<string, unknown>) ||
+            canonicalWechatChannelId((event.params as Record<string, unknown>).channel),
+        );
+        if (!hasWechatMessageContext) {
+            return;
+        }
+
+        canonicalizeWechatGlobalChannelRegistry(api, "before_message_tool_call_final");
+        await canonicalizeWechatCoreRuntimeChannelRegistries(api, "before_message_tool_call_final");
+        const normalizedMessageTool = normalizeWechatMessageToolCall({
+            rawParams: event.params as Record<string, unknown>,
+            ctx: ctx as Record<string, unknown>,
+            sessionKey: effectiveSessionKey,
+            senderId: resolveWechatContextSenderId(ctx as Record<string, unknown>, event.senderId),
+            logger: api.logger,
+        });
+        if (normalizedMessageTool.kind === "block") {
+            return {
+                block: true,
+                blockReason: normalizedMessageTool.blockReason,
+            };
+        }
+        if (normalizedMessageTool.kind !== "params") {
+            return;
+        }
+
+        const rawParams = event.params as Record<string, unknown>;
+        for (const key of Object.keys(rawParams)) {
+            if (!(key in normalizedMessageTool.params)) {
+                delete rawParams[key];
+            }
+        }
+        Object.assign(rawParams, normalizedMessageTool.params);
+        return {
+            params: rawParams,
+        };
+    }, { priority: -10_000 });
 }

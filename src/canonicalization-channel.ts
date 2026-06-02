@@ -3,12 +3,21 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { wechatPlugin } from "./channel.js";
+import { WECHAT_LEGACY_ALIAS_PLUGIN_MARKER, wechatPlugin } from "./channel.js";
 
 const WECHAT_LEGACY_CHANNEL_IDS = new Set(["openclaw-weixin", "weixin", "wechatid"]);
 const WECHAT_CANONICAL_CHANNEL_ID = "wechat";
 const WECHAT_LEGACY_CHANNEL_ALIASES = ["openclaw-weixin", "weixin", "wechatId"];
 const pluginRegistryStateSym = Symbol.for("openclaw.pluginRegistryState");
+
+type WechatPluginRegistryGlobalState = {
+    activeVersion?: number;
+    activeRegistry?: unknown;
+    channel?: {
+        registry?: unknown;
+        version?: number;
+    };
+};
 
 type WechatPluginRegistryRuntimeModule = {
     getActivePluginRegistry?: () => unknown;
@@ -38,6 +47,9 @@ function wechatPathExists(filePath: string): boolean {
 
 function canonicalizeWechatChannelPluginShape(plugin: any): boolean {
     if (!plugin || typeof plugin !== "object") {
+        return false;
+    }
+    if (plugin[WECHAT_LEGACY_ALIAS_PLUGIN_MARKER] === true) {
         return false;
     }
 
@@ -148,6 +160,27 @@ function canonicalizeWechatChannelRegistryObject(registry: any): {
     };
 }
 
+function bumpWechatChannelRegistryVersion(registries: unknown[]): void {
+    const state = (globalThis as Record<symbol, WechatPluginRegistryGlobalState | undefined>)[pluginRegistryStateSym];
+    if (!state) {
+        return;
+    }
+
+    const changedRegistries = registries.filter((registry, index, list) =>
+        Boolean(registry) && list.indexOf(registry) === index,
+    );
+    if (changedRegistries.length === 0) {
+        return;
+    }
+
+    if (changedRegistries.includes(state.activeRegistry)) {
+        state.activeVersion = (state.activeVersion ?? 0) + 1;
+    }
+    if (state.channel && changedRegistries.includes(state.channel.registry)) {
+        state.channel.version = (state.channel.version ?? 0) + 1;
+    }
+}
+
 export function canonicalizeWechatGlobalChannelRegistry(
     api: OpenClawPluginApi | undefined,
     reason: string,
@@ -173,6 +206,7 @@ export function canonicalizeWechatGlobalChannelRegistry(
     }
 
     if (patched > 0 || reordered > 0) {
+        bumpWechatChannelRegistryVersion(registries);
         api?.logger.info?.(
             `[WeChat] Canonicalized active channel registry reason=${reason}` +
             ` patched=${patched} reordered=${reordered}` +
@@ -244,6 +278,7 @@ export async function canonicalizeWechatCoreRuntimeChannelRegistries(
     }
 
     if (patched > 0 || reordered > 0) {
+        bumpWechatChannelRegistryVersion(registries);
         api?.logger.info?.(
             `[WeChat] Canonicalized core channel registry reason=${reason}` +
             ` patched=${patched} reordered=${reordered}` +

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export const WECHAT_OUTBOUND_MEDIA_DEDUP_TTL_MS = 10_000;
+export const WECHAT_OUTBOUND_MEDIA_DEDUP_TTL_MS = 90_000;
 const WECHAT_OUTBOUND_MEDIA_DEDUP_SAMPLE_BYTES = 128 * 1024;
 const recentOutboundMediaAt = new Map<string, number>();
 const WECHAT_OUTBOUND_IMAGE_VARIANT_TTL_MS = 90_000;

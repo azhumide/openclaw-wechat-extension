@@ -12,7 +12,7 @@ import { enqueueWechatInboundToolAuth } from "./runtime.js";
 import { maybeHandleWechatBlockedSkillIntent } from "./blocked-skill-intent.js";
 
 export const WECHAT_EXTENSION_BUILD_MARKER =
-    "wechat-subagent-core-runtime-channel-exact-canon-20260515";
+    "wechat-announce-final-text-direct-20260602";
 
 export async function handleInboundMessage(api: OpenClawPluginApi, body: any): Promise<void> {
     const logBody = { ...body };

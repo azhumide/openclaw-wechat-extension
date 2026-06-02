@@ -168,6 +168,21 @@ export function hasWechatMessageToolMediaIntent(params: Record<string, unknown>)
     if (Array.isArray(params.mediaUrls) && params.mediaUrls.some((value) => typeof value === "string" && value.trim())) {
         return true;
     }
+    if (Array.isArray(params.attachments)) {
+        for (const attachment of params.attachments) {
+            if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
+                continue;
+            }
+            const record = attachment as Record<string, unknown>;
+            if (
+                ["media", "mediaUrl", "path", "filePath", "fileUrl", "url"].some((field) =>
+                    typeof record[field] === "string" && record[field].trim()
+                )
+            ) {
+                return true;
+            }
+        }
+    }
     for (const field of ["message", "text", "content", "caption"] as const) {
         const value = params[field];
         if (typeof value === "string" && /(?:MEDIA|FILE):/i.test(value)) {
@@ -194,6 +209,7 @@ export function patchWechatMessageToolChannelField(params: Record<string, unknow
     reason?: string;
 } {
     const rawChannel = typeof params.channel === "string" ? params.channel.trim() : "";
+    const rawChannelLower = rawChannel.toLowerCase();
     if (!rawChannel) {
         params.channel = "wechat";
         return {
@@ -222,7 +238,7 @@ export function patchWechatMessageToolChannelField(params: Record<string, unknow
         };
     }
 
-    if (rawChannel === "openclaw-weixin" || rawChannel === "weixin") {
+    if (rawChannelLower === "openclaw-weixin" || rawChannelLower === "weixin") {
         params.channel = "wechat";
         return {
             changed: true,
