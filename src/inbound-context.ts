@@ -66,6 +66,9 @@ export function buildWechatInboundContext(params: {
     const sessionKey = `agent:main:wechat:${chatType}:${sessionChatKey}`;
     const mediaPath = params.media.mediaPath;
     const mediaType = params.media.mediaType;
+    const commandText = content || "";
+    const isTextSlashCommand = commandText.trimStart().startsWith("/");
+    const commandAuthorized = isTextSlashCommand && isMaster;
 
     const peer = {
         id: sessionChatKey,
@@ -128,8 +131,42 @@ export function buildWechatInboundContext(params: {
         Body: content || "",
         rawBody: content || "",
         RawBody: content || "",
-        commandBody: content || "",
-        CommandBody: content || "",
+        bodyForAgent: content || "",
+        BodyForAgent: content || "",
+        bodyForCommands: commandText,
+        BodyForCommands: commandText,
+        commandBody: commandText,
+        CommandBody: commandText,
+        commandSource: isTextSlashCommand ? "text" : undefined,
+        CommandSource: isTextSlashCommand ? "text" : undefined,
+        commandAuthorized,
+        CommandAuthorized: commandAuthorized,
+        commandTurn: isTextSlashCommand
+            ? {
+                kind: "text-slash",
+                source: "text",
+                authorized: commandAuthorized,
+                body: commandText,
+            }
+            : {
+                kind: "normal",
+                source: "message",
+                authorized: false,
+                body: commandText,
+            },
+        CommandTurn: isTextSlashCommand
+            ? {
+                kind: "text-slash",
+                source: "text",
+                authorized: commandAuthorized,
+                body: commandText,
+            }
+            : {
+                kind: "normal",
+                source: "message",
+                authorized: false,
+                body: commandText,
+            },
         msgId: messageId,
         MsgId: messageId,
         mediaPath,
