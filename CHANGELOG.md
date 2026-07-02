@@ -1,5 +1,12 @@
 # openclaw-wechat-extension 更新日志
 
+## [v1.4.1] - 2026-07-02
+
+### 修复
+- **移除废弃钩子**：删除了 `subagent_spawning` 生命周期钩子注册，改用 `subagent_spawned`。消除 OpenClaw 2026.6.11 启动时打印的 deprecation warning（`typed hook "subagent_spawning" is deprecated`），提升启动日志整洁度。此钩子已在 Core 层面被替代，移除不影响任何功能。
+
+# openclaw-wechat-extension 更新日志
+
 ## [v1.2.0] - 2026-05-06
 
 ### 变更
