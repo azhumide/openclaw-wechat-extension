@@ -752,66 +752,6 @@ export function registerWechatSubagentLifecycleHooks(api: OpenClawPluginApi): vo
         };
     }, { priority: 9_600 });
 
-    api.on("subagent_spawning", async (event, ctx) => {
-        canonicalizeWechatGlobalChannelRegistry(api, "subagent_spawning");
-        const requesterSessionKey = resolveWechatContextSessionKey({
-            sessionKey: ctx.requesterSessionKey,
-            SessionKey: (ctx as Record<string, unknown>).RequesterSessionKey,
-        });
-        const normalized = normalizeWechatSubagentDeliveryOrigin({
-            origin: event.requester,
-            requesterSessionKey,
-        });
-        const cfg = api.runtime.config.current();
-        await Promise.all([
-            canonicalizeWechatCoreRuntimeChannelRegistries(api, "subagent_spawning"),
-            canonicalizeWechatSessionStoreRouteForConfig({
-                api,
-                cfg: cfg as Record<string, unknown>,
-                sessionKey: requesterSessionKey,
-                reason: "subagent_spawning",
-                force: Boolean(normalized),
-            }),
-            canonicalizeWechatActiveSubagentRuntimeOrigins({
-                api,
-                childSessionKey: event.childSessionKey,
-                requesterSessionKey,
-                reason: "subagent_spawning",
-            }),
-            canonicalizeWechatSubagentRegistryOrigins({
-                api,
-                childRunId: ctx.runId,
-                requesterSessionKey,
-                reason: "subagent_spawning",
-            }),
-        ]);
-        if (!normalized) {
-            return;
-        }
-        if (event.requester && typeof event.requester === "object") {
-            event.requester.channel = normalized.origin.channel;
-            event.requester.accountId = normalized.origin.accountId;
-            event.requester.to = normalized.origin.to;
-            if (normalized.origin.threadId != null) {
-                event.requester.threadId = normalized.origin.threadId;
-            }
-        }
-        if (normalized.changed) {
-            const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
-            api.logger.info(
-                `[WeChat] Canonicalized subagent spawning origin child=${event.childSessionKey || ""}` +
-                ` requester=${requesterSessionKey || ""}` +
-                ` channel=${normalized.previousChannel || "missing"}->wechat` +
-                ` to=${redactWechatTextForLogs(summarizeWechatTextForLog(normalized.origin.to || "", 120), bridgeConfig)}` +
-                `${normalized.inferredFromSession ? " source=session-key" : ""}`,
-            );
-        }
-        return {
-            status: "ok" as const,
-            deliveryOrigin: normalized.origin,
-        };
-    }, { priority: 10_000 });
-
     api.on("subagent_delivery_target", async (event, ctx) => {
         canonicalizeWechatGlobalChannelRegistry(api, "subagent_delivery_target");
         const normalized = normalizeWechatSubagentDeliveryOrigin({
