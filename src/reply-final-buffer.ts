@@ -1,5 +1,5 @@
 export function createWechatReplyFinalBuffer() {
-    let bufferedFinalReply: { args: any[] } | null = null;
+    let bufferedFinalReply: { args: any[]; isError: boolean } | null = null;
     let bufferedFinalReplyCount = 0;
     let flushingBufferedFinalReply = false;
 
@@ -22,9 +22,15 @@ export function createWechatReplyFinalBuffer() {
             return flushingBufferedFinalReply;
         },
         buffer(args: any[]) {
-            bufferedFinalReply = {
-                args: cloneReplyArgs(args),
-            };
+            const isError = args[0]?.isError === true;
+            // Keep the assistant's normal final when OpenClaw also emits a
+            // follow-up tool warning. The frontend renders that normal final.
+            if (!bufferedFinalReply || !isError || bufferedFinalReply.isError) {
+                bufferedFinalReply = {
+                    args: cloneReplyArgs(args),
+                    isError,
+                };
+            }
             bufferedFinalReplyCount += 1;
             return bufferedFinalReplyCount;
         },

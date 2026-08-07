@@ -328,7 +328,7 @@ export async function dispatchWechatReplyForInbound(params: {
 
     await finalBuffer.flush(async (finalReplyArgs) => {
         api.logger.info(
-            `[WeChat] Flushing latest buffered final reply session=${sessionKey} ` +
+            `[WeChat] Flushing preferred buffered final reply session=${sessionKey} ` +
             `trace=${replyMediaDispatchId} bufferedFinals=${finalBuffer.count}`,
         );
         await deliverWechatReply(...finalReplyArgs);
