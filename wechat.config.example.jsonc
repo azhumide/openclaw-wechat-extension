@@ -15,8 +15,11 @@
   // 兼容字段。当前单端口直连模式下通常保持和 wsHost 一致即可
   "bridgeDownloadHost": "127.0.0.1",
 
-  // 兼容字段。当前单端口直连模式下通常留空即可
-  "bridgeDownloadBaseUrl": "",
+  // AiBot 媒体 HTTP 中转基础地址，跨机器部署时填写 AiBot 可访问地址
+  "bridgeDownloadBaseUrl": "http://aibot-host:9090",
+
+  // AiBot 媒体中转令牌，需要与 main_config.toml 的 BridgeMedia.access_token 一致
+  "bridgeMediaToken": "",
 
   // OpenClaw Workspace 根目录
   // 建议显式填写，避免不同环境自动推断出错

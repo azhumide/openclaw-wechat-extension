@@ -7,6 +7,7 @@ import {
 } from "./runtime.js";
 import { redactWechatWxids } from "./redaction.js";
 import { summarizeWechatTextForLog } from "./text.js";
+import { uploadWechatLocalMediaToBridge } from "./bridge-media.js";
 import {
     buildWechatOutboundMediaDedupKey,
     claimWechatOutboundMediaDedup,
@@ -199,19 +200,30 @@ export async function sendWechatOutboundMedia({
                 return { ok: true, channel: "wechat", messageId: `msg-${Date.now()}` };
             }
 
-            if (fs.existsSync(absolutePath) && !isPathWithinRoots(absolutePath, serveRoots)) {
-                const stageBase = bridgeConfig.tmpDir
-                    ? path.resolve(bridgeConfig.tmpDir)
-                    : path.join(bridgeConfig.workspaceBase, "downloads");
-                const stageDir = path.join(stageBase, "wechat-bridge-media");
-                fs.mkdirSync(stageDir, { recursive: true });
-                const stagedName = `${Date.now()}_${path.basename(absolutePath)}`;
-                const stagedPath = path.join(stageDir, stagedName);
-                fs.copyFileSync(absolutePath, stagedPath);
-                absolutePath = stagedPath;
+            const uploadedUrl = await uploadWechatLocalMediaToBridge({
+                filePath: absolutePath,
+                config: bridgeConfig,
+                logger: (runtime as any).logger ?? console,
+            });
+            if (uploadedUrl) {
+                resolvedUrl = uploadedUrl;
+                runtime?.logger?.info?.(
+                    `[WeChat] 媒体通过 HTTP 中转发送: ${summarizeWechatTextForLog(absolutePath, 180)}`,
+                );
+            } else {
+                if (fs.existsSync(absolutePath) && !isPathWithinRoots(absolutePath, serveRoots)) {
+                    const stageBase = bridgeConfig.tmpDir
+                        ? path.resolve(bridgeConfig.tmpDir)
+                        : path.join(bridgeConfig.workspaceBase, "downloads");
+                    const stageDir = path.join(stageBase, "wechat-bridge-media");
+                    fs.mkdirSync(stageDir, { recursive: true });
+                    const stagedName = `${Date.now()}_${path.basename(absolutePath)}`;
+                    const stagedPath = path.join(stageDir, stagedName);
+                    fs.copyFileSync(absolutePath, stagedPath);
+                    absolutePath = stagedPath;
+                }
+                resolvedUrl = absolutePath;
             }
-
-            resolvedUrl = absolutePath;
 
             const imageVariantDecision = shouldSuppressWechatStagedImageVariant({
                 to,

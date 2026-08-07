@@ -7,6 +7,7 @@ export const wechatChannelConfigSchema = {
             wsPath: { type: "string", description: "OpenClawBridge WS path" },
             bridgeDownloadHost: { type: "string", description: "Bridge HTTP download host/IP for remote media access" },
             bridgeDownloadBaseUrl: { type: "string", description: "Full public base URL for bridge downloads, e.g. https://example.com" },
+            bridgeMediaToken: { type: "string", description: "Shared token for authenticated bridge media upload" },
             workspaceBase: { type: "string", description: "Workspace base path used for temp/download files" },
             tmpDir: { type: "string", description: "Override temp directory for inbound media files" },
             mediaSearchPaths: {

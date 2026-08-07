@@ -12,6 +12,7 @@ type PartialWechatExtensionConfig = {
     wsPath?: string;
     bridgeDownloadHost?: string;
     bridgeDownloadBaseUrl?: string;
+    bridgeMediaToken?: string;
     workspaceBase?: string;
     tmpDir?: string;
     mediaSearchPaths?: string[];
@@ -48,6 +49,7 @@ export type WechatExtensionConfig = {
     wsPath: string;
     bridgeDownloadHost: string;
     bridgeDownloadBaseUrl: string;
+    bridgeMediaToken: string;
     workspaceBase: string;
     tmpDir: string;
     mediaSearchPaths: string[];
@@ -235,6 +237,10 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
         normalizeBaseUrl(root.bridgeDownloadBaseUrl) ||
         local.bridgeDownloadBaseUrl ||
         "";
+    const bridgeMediaToken =
+        normalizeString(root.bridgeMediaToken) ||
+        local.bridgeMediaToken ||
+        "";
     const workspaceBase =
         normalizeString(root.workspaceBase) ||
         local.workspaceBase ||
@@ -349,6 +355,7 @@ export function resolveWechatExtensionConfig(cfg: any, logger?: LoggerLike): Wec
         wsPath,
         bridgeDownloadHost,
         bridgeDownloadBaseUrl,
+        bridgeMediaToken,
         workspaceBase,
         tmpDir,
         mediaSearchPaths,
