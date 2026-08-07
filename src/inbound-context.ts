@@ -62,7 +62,9 @@ export function buildWechatInboundContext(params: {
     const resolvedSenderId = senderId || from;
     const resolvedSenderName = senderName || fromName || "User";
     const conversationLabel = isGroup ? (groupName || fromName || from) : resolvedSenderName;
-    const sessionChatKey = from.trim().toLowerCase();
+    // Direct bridge callbacks may use a delivery alias in `from`; senderId is
+    // the stable WeChat identity. Keep `from` for delivery, not session state.
+    const sessionChatKey = (isGroup ? from : resolvedSenderId).trim().toLowerCase();
     const sessionKey = `agent:main:wechat:${chatType}:${sessionChatKey}`;
     const mediaPath = params.media.mediaPath;
     const mediaType = params.media.mediaType;
