@@ -171,6 +171,7 @@ function sanitizeLocalConfig(raw: unknown): PartialWechatExtensionConfig {
         wsPath: normalizeWsPath(source.wsPath),
         bridgeDownloadHost: normalizeString(source.bridgeDownloadHost),
         bridgeDownloadBaseUrl: normalizeBaseUrl(source.bridgeDownloadBaseUrl),
+        bridgeMediaToken: normalizeString(source.bridgeMediaToken),
         workspaceBase: normalizeString(source.workspaceBase),
         tmpDir: normalizeString(source.tmpDir),
         mediaSearchPaths: normalizeStringArray(source.mediaSearchPaths),

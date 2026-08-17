@@ -3,22 +3,34 @@
   "wsPort": 9093,
   "wsPath": "/ws",
   "bridgeDownloadHost": "10.10.10.80",
-  "bridgeDownloadBaseUrl": "",
+  "bridgeDownloadBaseUrl": "http://10.10.10.80:9090",
   "workspaceBase": "/home/rs/.openclaw/workspace",
   "tmpDir": "/home/rs/.openclaw/workspace/downloads",
   "mediaSearchPaths": [],
   "redactWxidsInOutboundText": true,
   "redactWxidsInLogs": true,
   "redactExtraWxids": [
-    "xdoufux"
+    "xdoufux",
+    "azhumideo"
   ],
-  "nonOwnerToolAuthMode": "off",
-  "nonOwnerToolAuthTools": [],
+  "nonOwnerToolAuthMode": "deny",
+  "nonOwnerToolAuthTools": [
+    "exec",
+    "process"
+  ],
   "toolAuthBypassWxids": [
-    "*"
+    "wxid_9uwska6u4yzm22",
+    "azhumideo"
   ],
   "toolAuthBypassByTool": {},
-  "toolAuthBlockedSkills": [],
+  "toolAuthBlockedSkills": [
+    "gog",
+    "gws-gmail",
+    "didi-ride-skill",
+    "kdocs",
+    "626-rotator-skill",
+    "gitlab-helper"
+  ],
   "toolAuthAllowInstalledSkills": true,
   "toolAuthAllowMcporterExec": true,
   "toolAuthAllowSafeReadonlyExec": true,
@@ -35,5 +47,6 @@
   "toolAuthMessageAllowAlways": "{{toolName}} 已设为总是允许，当前继续执行。",
   "toolAuthMessageDeny": "{{toolName}} 审批被拒绝，本次不会执行。",
   "toolAuthMessageTimeout": "{{toolName}} 审批超时，本次不会执行。",
-  "toolAuthMessageCancelled": "{{toolName}} 审批已取消，本次不会执行。"
+  "toolAuthMessageCancelled": "{{toolName}} 审批已取消，本次不会执行。",
+  "bridgeMediaToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJsaWNfaWQiOiI1NjFmYmY3My01ZDA3LTRjODEtOTYyZC1jOGJlZDA5YWFlMmEiLCJjdXN0b21lciI6IkJvc3MgXHU3NTFmXHU0ZWE3XHU2NzBkXHU1MmExXHU1NjY4IChcdTk2M2ZcdTczMmFcdTdjNzNcdTVmYjcpIiwibWFjaGluZV9pZCI6Ijc5NjU1YmJjYzM0MDZjMGY3MjM3YmU1MTZhNDk5YjUyIiwiaWF0IjoxNzg2Nzc5NzE2LCJleHAiOjIxMDIxMzk3MTYsImZlYXR1cmVzIjpbImFsbCJdfQ.g5zMQaFPLArz5eGAZkMjR1YbJRqK9AdFl3xHQuZmYRk"
 }
