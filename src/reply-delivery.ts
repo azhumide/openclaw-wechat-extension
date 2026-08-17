@@ -1,4 +1,5 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { dispatchChannelInboundTurn } from "openclaw/plugin-sdk/channel-inbound";
 import { resolveWechatExtensionConfig } from "./config.js";
 import type { WechatInboundContext } from "./inbound-context.js";
 import { createWechatReplyFinalBuffer } from "./reply-final-buffer.js";
@@ -62,6 +63,7 @@ export async function dispatchWechatReplyForInbound(params: {
         resolvedSenderId,
         resolvedSenderName,
         sessionKey,
+        sessionChatKey,
         upstreamMessageTraceId,
     } = inbound;
 
@@ -307,12 +309,39 @@ export async function dispatchWechatReplyForInbound(params: {
         onTyping: async () => { },
     } as any);
 
-    const dispatchResult = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-        ctx,
+    const dispatchTurn = await dispatchChannelInboundTurn({
         cfg,
+        channel: "wechat",
+        accountId,
+        route: {
+            agentId: "main",
+            sessionKey,
+        },
+        ctxPayload: runtime.channel.reply.finalizeInboundContext(ctx) as any,
+        record: {
+            updateLastRoute: {
+                sessionKey,
+                channel: "wechat",
+                to: from,
+                accountId,
+                threadId: sessionChatKey,
+            },
+            onRecordError: (err) => {
+                api.logger.warn?.(
+                    `[WeChat] Failed to record inbound session route session=${sessionKey} err=${String(err)}`,
+                );
+            },
+        },
+        delivery: {
+            deliverWithProviderMessageSending: deliverWechatReply,
+            onError: async (err) => {
+                api.logger.warn?.(
+                    `[WeChat] Reply delivery failed session=${sessionKey} err=${String(err)}`,
+                );
+            },
+        },
         dispatcherOptions: {
             ...baseDispatcher,
-            deliver: deliverWechatReply,
         },
         replyOptions: {
             sourceReplyDeliveryMode: "automatic",
@@ -325,6 +354,7 @@ export async function dispatchWechatReplyForInbound(params: {
             }
         }
     });
+    const dispatchResult = dispatchTurn.dispatchResult;
 
     await finalBuffer.flush(async (finalReplyArgs) => {
         api.logger.info(

@@ -12,38 +12,23 @@
   "redactExtraWxids": [
     "xdoufux"
   ],
-  "nonOwnerToolAuthMode": "deny",
-  "nonOwnerToolAuthTools": [
-    "exec",
-    "write"
-  ],
+  "nonOwnerToolAuthMode": "off",
+  "nonOwnerToolAuthTools": [],
   "toolAuthBypassWxids": [
-    "wxid_9uwska6u4yzm22",
-    "gcicac"
+    "*"
   ],
-  "toolAuthBypassByTool": {
-    "process": [
-      "xdoufux"
-    ]
-  },
-  "toolAuthBlockedSkills": [
-    "gog",
-    "gws-gmail",
-    "didi-ride-skill",
-    "kdocs",
-    "626-rotator-skill",
-    "gitlab-helper"
-  ],
+  "toolAuthBypassByTool": {},
+  "toolAuthBlockedSkills": [],
   "toolAuthAllowInstalledSkills": true,
   "toolAuthAllowMcporterExec": true,
   "toolAuthAllowSafeReadonlyExec": true,
-  "toolAuthDebugInstalledSkills": true,
+  "toolAuthDebugInstalledSkills": false,
   "ownerExecBypassApproval": true,
-  "toolAuthNotifyBlocked": true,
-  "toolAuthNotifyApprovalQueued": true,
-  "toolAuthNotifyApprovalResolved": true,
-  "toolAuthNotifyInGroup": true,
-  "toolAuthNotifyInDirect": true,
+  "toolAuthNotifyBlocked": false,
+  "toolAuthNotifyApprovalQueued": false,
+  "toolAuthNotifyApprovalResolved": false,
+  "toolAuthNotifyInGroup": false,
+  "toolAuthNotifyInDirect": false,
   "toolAuthMessageBlocked": "你没有权限调用 {{toolName}}。当前来源：{{chatTypeLabel}} / {{conversationLabel}}",
   "toolAuthMessageQueued": "{{toolName}} 已提交审批，请稍候。",
   "toolAuthMessageAllowOnce": "{{toolName}} 已批准，本次继续执行。",

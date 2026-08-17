@@ -1,8 +1,4 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import {
-    recordWechatInboundSessionRoute,
-    refreshWechatDirectSessionDisplayName,
-} from "./canonicalization.js";
 import { resolveWechatExtensionConfig } from "./config.js";
 import { sendWechatToolAuthNotice } from "./dedup.js";
 import { buildWechatInboundContext, buildWechatInboundLogLine } from "./inbound-context.js";
@@ -28,7 +24,7 @@ export async function handleInboundMessage(api: OpenClawPluginApi, body: any): P
     } = body;
 
     const runtime = api.runtime;
-    const cfg = runtime.config.current();
+    const cfg = (typeof runtime?.config?.current === "function" ? runtime.config.current() : (api as any)?.config) || {};
 
     if (runtime.channel.activity?.record) {
         runtime.channel.activity.record({
@@ -68,26 +64,6 @@ export async function handleInboundMessage(api: OpenClawPluginApi, body: any): P
         inbound,
         buildMarker: WECHAT_EXTENSION_BUILD_MARKER,
     }));
-
-    await recordWechatInboundSessionRoute({
-        api,
-        cfg: cfg as Record<string, unknown>,
-        sessionKey,
-        ctx,
-        to: from,
-        accountId: accountId || "default",
-        threadId: sessionChatKey,
-    });
-
-    if (chatType === "direct") {
-        void refreshWechatDirectSessionDisplayName({
-            api,
-            cfg: cfg as Record<string, unknown>,
-            sessionKey,
-            ctx,
-            displayName: conversationLabel || resolvedSenderName,
-        });
-    }
 
     enqueueWechatInboundToolAuth({
         sessionKey,

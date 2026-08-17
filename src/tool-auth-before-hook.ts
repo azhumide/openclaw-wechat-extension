@@ -1,9 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import {
     canonicalWechatChannelId,
-    canonicalizeWechatCoreRuntimeChannelRegistries,
-    canonicalizeWechatGlobalChannelRegistry,
-    canonicalizeWechatSessionStoreRouteForConfig,
 } from "./canonicalization.js";
 import type { resolveWechatExtensionConfig } from "./config.js";
 import {
@@ -208,16 +205,6 @@ export function registerWechatToolAuthBeforeHooks(params: {
         return appendSystemContext ? { appendSystemContext } : undefined;
     }, { priority: 10_000 });
 
-    api.on("before_agent_start", (_event, ctx) => {
-        tryBindWechatToolAuthForRun({
-            api,
-            ctx: ctx as Record<string, unknown>,
-            hookName: "before_agent_start",
-            runId: ctx.runId,
-        });
-        return;
-    }, { priority: 100 });
-
     api.on("before_tool_call", async (event, ctx) => {
         const cfg = api.runtime.config.current();
         const bridgeConfig = resolveConfig(cfg, api.logger);
@@ -250,24 +237,12 @@ export function registerWechatToolAuthBeforeHooks(params: {
             resolveWechatContextChannelAlias(ctx as Record<string, unknown>) ||
             (event.params && typeof event.params === "object" && canonicalWechatChannelId((event.params as Record<string, unknown>).channel)),
         );
-        if (effectiveSessionKey && (effectiveSessionKey.includes(":wechat:") || preliminaryWechatAuth)) {
-            void canonicalizeWechatSessionStoreRouteForConfig({
-                api,
-                cfg: cfg as Record<string, unknown>,
-                sessionKey: effectiveSessionKey,
-                reason: "before_tool_call",
-                force: Boolean(preliminaryWechatAuth),
-            });
-        }
-
         if (
             toolName === "message" &&
             hasWechatMessageContext &&
             event.params &&
             typeof event.params === "object"
         ) {
-            canonicalizeWechatGlobalChannelRegistry(api, "before_message_tool_call");
-            await canonicalizeWechatCoreRuntimeChannelRegistries(api, "before_message_tool_call");
             const normalizedMessageTool = normalizeWechatMessageToolCall({
                 rawParams: event.params as Record<string, unknown>,
                 ctx: ctx as Record<string, unknown>,
@@ -589,8 +564,6 @@ export function registerWechatToolAuthBeforeHooks(params: {
             return;
         }
 
-        canonicalizeWechatGlobalChannelRegistry(api, "before_message_tool_call_final");
-        await canonicalizeWechatCoreRuntimeChannelRegistries(api, "before_message_tool_call_final");
         const normalizedMessageTool = normalizeWechatMessageToolCall({
             rawParams: event.params as Record<string, unknown>,
             ctx: ctx as Record<string, unknown>,

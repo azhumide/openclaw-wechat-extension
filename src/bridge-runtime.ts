@@ -418,7 +418,7 @@ async function ensureWechatBridgeStarted(
 
     const performStart = async () => {
         const runtime = api.runtime;
-        const cfg = runtime.config.current();
+        const cfg = (typeof runtime?.config?.current === "function" ? runtime.config.current() : (api as any)?.config) || {};
         const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
         const wsConfig: WechatBridgeWsConfig = {
             host: bridgeConfig.wsHost,

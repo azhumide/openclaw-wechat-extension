@@ -32,7 +32,6 @@ import { wechatChannelConfigSchema } from "./channel-config-schema.js";
 import { handleWechatReactionAction } from "./channel-reactions.js";
 
 const WECHAT_CHANNEL_MODE = "bridge-ws";
-export const WECHAT_LEGACY_ALIAS_PLUGIN_MARKER = "__wechatLegacyAliasPlugin";
 
 function createWechatSendReceipt(params: {
     messageId?: string;
@@ -325,28 +324,3 @@ export const wechatPlugin: ChannelPlugin<any> = {
         sendMedia: sendWechatOutboundMedia,
     },
 };
-
-export function createWechatLegacyAliasPlugin(id: "openclaw-weixin" | "weixin"): ChannelPlugin<any> {
-    return {
-        ...wechatPlugin,
-        id,
-        meta: {
-            ...wechatPlugin.meta,
-            id,
-            label: `WeChat (${id} alias)`,
-            selectionLabel: "WeChat (legacy alias)",
-            aliases: [],
-            blurb: "Compatibility channel alias that routes through the WeChat plugin.",
-            showConfigured: false,
-            showInSetup: false,
-            exposure: {
-                configured: false,
-                setup: false,
-                docs: false,
-            },
-        },
-        gateway: undefined,
-        status: undefined,
-        [WECHAT_LEGACY_ALIAS_PLUGIN_MARKER]: true,
-    } as ChannelPlugin<any> & Record<string, unknown>;
-}

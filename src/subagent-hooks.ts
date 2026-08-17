@@ -1,11 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import {
     canonicalWechatChannelId,
-    canonicalizeWechatActiveSubagentRuntimeOrigins,
-    canonicalizeWechatCoreRuntimeChannelRegistries,
-    canonicalizeWechatGlobalChannelRegistry,
-    canonicalizeWechatSessionStoreRouteForConfig,
-    canonicalizeWechatSubagentRegistryOrigins,
     normalizeWechatSubagentDeliveryOrigin,
 } from "./canonicalization.js";
 import { wechatPlugin } from "./channel.js";
@@ -753,34 +748,11 @@ export function registerWechatSubagentLifecycleHooks(api: OpenClawPluginApi): vo
     }, { priority: 9_600 });
 
     api.on("subagent_delivery_target", async (event, ctx) => {
-        canonicalizeWechatGlobalChannelRegistry(api, "subagent_delivery_target");
         const normalized = normalizeWechatSubagentDeliveryOrigin({
             origin: event.requesterOrigin,
             requesterSessionKey: event.requesterSessionKey,
         });
         const cfg = api.runtime.config.current();
-        await Promise.all([
-            canonicalizeWechatCoreRuntimeChannelRegistries(api, "subagent_delivery_target"),
-            canonicalizeWechatSessionStoreRouteForConfig({
-                api,
-                cfg: cfg as Record<string, unknown>,
-                sessionKey: event.requesterSessionKey,
-                reason: "subagent_delivery_target",
-            }),
-            canonicalizeWechatSubagentRegistryOrigins({
-                api,
-                childRunId: event.childRunId || ctx.runId,
-                requesterSessionKey: event.requesterSessionKey,
-                reason: "subagent_delivery_target",
-            }),
-            canonicalizeWechatActiveSubagentRuntimeOrigins({
-                api,
-                childRunId: event.childRunId || ctx.runId,
-                childSessionKey: event.childSessionKey,
-                requesterSessionKey: event.requesterSessionKey,
-                reason: "subagent_delivery_target",
-            }),
-        ]);
         if (!normalized) {
             return;
         }
@@ -857,7 +829,6 @@ export function registerWechatSubagentLifecycleHooks(api: OpenClawPluginApi): vo
     }, { priority: 10_000 });
 
     api.on("subagent_spawned", async (event, ctx) => {
-        canonicalizeWechatGlobalChannelRegistry(api, "subagent_spawned");
         const requesterSessionKey = resolveWechatContextSessionKey({
             sessionKey: ctx.requesterSessionKey,
             SessionKey: (ctx as Record<string, unknown>).RequesterSessionKey,
@@ -869,36 +840,6 @@ export function registerWechatSubagentLifecycleHooks(api: OpenClawPluginApi): vo
         if (!childSessionKey || !requesterSessionKey) {
             return;
         }
-        const cfg = api.runtime.config.current();
-        await Promise.all([
-            canonicalizeWechatCoreRuntimeChannelRegistries(api, "subagent_spawned"),
-            canonicalizeWechatSessionStoreRouteForConfig({
-                api,
-                cfg: cfg as Record<string, unknown>,
-                sessionKey: requesterSessionKey,
-                reason: "subagent_spawned:requester",
-            }),
-            canonicalizeWechatSessionStoreRouteForConfig({
-                api,
-                cfg: cfg as Record<string, unknown>,
-                sessionKey: childSessionKey,
-                reason: "subagent_spawned:child",
-                force: true,
-            }),
-            canonicalizeWechatSubagentRegistryOrigins({
-                api,
-                childRunId: event.runId || ctx.runId,
-                requesterSessionKey,
-                reason: "subagent_spawned",
-            }),
-            canonicalizeWechatActiveSubagentRuntimeOrigins({
-                api,
-                childRunId: event.runId || ctx.runId,
-                childSessionKey,
-                requesterSessionKey,
-                reason: "subagent_spawned",
-            }),
-        ]);
         inheritWechatToolAuthForChildSession({
             requesterSessionKey,
             childSessionKey,

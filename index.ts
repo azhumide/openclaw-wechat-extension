@@ -10,11 +10,7 @@ import {
     triggerWechatBridgeStart,
 } from "./src/bridge-runtime.js";
 import { maybeTriggerWechatBridgeStart } from "./src/bridge-autostart.js";
-import {
-    canonicalizeWechatCoreRuntimeChannelRegistries,
-    canonicalizeWechatGlobalChannelRegistry,
-} from "./src/canonicalization.js";
-import { createWechatLegacyAliasPlugin, wechatPlugin } from "./src/channel.js";
+import { wechatPlugin } from "./src/channel.js";
 import { resolveWechatExtensionConfig } from "./src/config.js";
 import {
     claimWechatToolAuthLogDedup,
@@ -162,10 +158,6 @@ const plugin = {
             logWechatBridgeState(api, "register:init", sharedState);
 
             api.registerChannel({ plugin: wechatPlugin });
-            api.registerChannel({ plugin: createWechatLegacyAliasPlugin("openclaw-weixin") });
-            api.registerChannel({ plugin: createWechatLegacyAliasPlugin("weixin") });
-            canonicalizeWechatGlobalChannelRegistry(api, "register");
-            void canonicalizeWechatCoreRuntimeChannelRegistries(api, "register");
         }
     },
     unregister(api: OpenClawPluginApi) {
