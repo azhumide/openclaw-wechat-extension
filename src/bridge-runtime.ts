@@ -43,8 +43,14 @@ export type WechatBridgeInboundHandler = (
 ) => Promise<void> | void;
 
 export function getWechatBridgeGlobalState(): WechatBridgeGlobalState {
-    const holder = globalThis as Record<symbol, any>;
-    const existing = (holder[globalSym] ??= {});
+    // OpenClaw can evaluate an extension in more than one VM context during
+    // plugin reload. `globalThis` is context-local in that case, so keeping
+    // this state there creates one WebSocket per context. `process` is shared
+    // by all extension contexts in the gateway process.
+    const processHolder = process as unknown as Record<symbol, any>;
+    const legacyHolder = globalThis as Record<symbol, any>;
+    const existing = (processHolder[globalSym] ??= legacyHolder[globalSym] ?? {});
+    legacyHolder[globalSym] = existing;
     if (!("runtime" in existing)) existing.runtime = null;
     if (!("wsServer" in existing)) existing.wsServer = null;
     if (!("activeSocket" in existing)) existing.activeSocket = null;
@@ -351,6 +357,12 @@ async function connectBridgeClient(
     if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
         return;
     }
+    if (activeSocket) {
+        try {
+            activeSocket.terminate();
+        } catch { }
+        setActiveBridgeSocket(null);
+    }
 
     state.clientConnecting = true;
     const targetUrl = buildWechatBridgeServerUrl(wsConfig);
@@ -372,6 +384,14 @@ async function connectBridgeClient(
         };
 
         socket.once("open", () => {
+            // A reconnect can race with a plugin reload. Keep exactly one
+            // socket authoritative and actively release the replaced one.
+            const previousSocket = getActiveBridgeSocket();
+            if (previousSocket && previousSocket !== socket) {
+                try {
+                    previousSocket.terminate();
+                } catch { }
+            }
             attachBridgeClientSocketHandlers(api, socket, onInboundMessage);
             api.logger.info(`[WeChat] Bridge WS connected: ${targetUrl}`);
             finishResolve();

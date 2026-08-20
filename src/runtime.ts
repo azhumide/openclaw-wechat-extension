@@ -57,8 +57,13 @@ export type WechatBlockedReplyRecord = {
 };
 
 const getGlobalState = (): WeChatBridgeState => {
-    const holder = globalThis as any;
-    const state = (holder[globalSym] ??= {});
+    // Keep this in the process object rather than a VM-local globalThis. The
+    // bridge runtime and channel runtime must share one socket across plugin
+    // reload contexts.
+    const processHolder = process as any;
+    const legacyHolder = globalThis as any;
+    const state = (processHolder[globalSym] ??= legacyHolder[globalSym] ?? {});
+    legacyHolder[globalSym] = state;
     if (!("runtime" in state)) state.runtime = null;
     if (!("wsServer" in state)) state.wsServer = null;
     if (!("activeSocket" in state)) state.activeSocket = null;
