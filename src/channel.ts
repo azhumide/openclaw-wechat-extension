@@ -96,6 +96,12 @@ const wechatMessageAdapter = defineChannelMessageAdapter({
             text: true,
             media: true,
             replyTo: true,
+            // 核心 durable 分支的默认必需位（capabilities.ts:
+            // `params.messageSendingHooks !== false`）。缺失会导致核心
+            // 静默回退 legacy 直发，不报错、不打日志。
+            // 注意：入站回复走标准 direct 分支（路径 ②）时不校验此位；
+            // 它影响的是出站（message 工具 / queuePolicy 路径）的 durable 分支。
+            messageSendingHooks: true,
         },
     },
     send: {

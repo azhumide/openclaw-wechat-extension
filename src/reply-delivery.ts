@@ -371,8 +371,13 @@ export async function dispatchWechatReplyForInbound(params: {
                 );
             },
         },
+        // 标准 direct 分支（路径 ②）：核心在调用本回调前已完成 payload 准备并跑过
+        // `message_sending`，所以 `message_sending` 的唯一拥有者是核心。
+        // 原用的 provider funnel 是官方定义的 "exceptional" 路径，会跳过核心钩子，
+        // 并要求插件自行履行三项义务（授权断言 / 派发提交 / 绑定待决投递）——
+        // 本插件一项未履行，故改走标准分支。
         delivery: {
-            deliverWithProviderMessageSending: deliverWechatReply,
+            deliver: deliverWechatReply,
             onError: async (err) => {
                 api.logger.warn?.(
                     `[WeChat] Reply delivery failed session=${sessionKey} err=${String(err)}`,

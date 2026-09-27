@@ -137,12 +137,7 @@ describe("T5 投递回调的诚实返回值契约", () => {
         );
     });
 
-    test("仍走 provider funnel（funnel 与 durable/deliver 互斥；迁移时须同步更新本测试）", () => {
-        assert.equal(
-            /deliverWithProviderMessageSending/.test(deliverySource()),
-            true,
-            "funnel 用法已变化：若已迁移到 durable/deliver 双分支，" +
-                "返回值语义与义务集合都会改变，请重新审计并更新本测试。",
-        );
-    });
+    // 注：原先此处有一条守卫断言「仍走 provider funnel（迁移时须同步更新本测试）」。
+    // 迁移已完成 → 该断言已由 tests/contract-migration.test.ts 的 T6 取代
+    // （断言 delivery 声明用 `deliver` 键、且不再出现 deliverWithProviderMessageSending）。
 });
