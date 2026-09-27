@@ -286,8 +286,16 @@ export async function dispatchWechatReplyForInbound(params: {
                 api.logger.info(
                     `[WeChat] Buffered media-only block count=${bufferedMediaCount} waitMs=${mediaState.pendingBlockMediaDelayMs}`,
                 );
-                // 延后：由 1.2s 定时器或回合末 flush 投递，此刻尚未发出。
-                return deferWechatDelivery();
+                // 延后投递：留一个短窗口等后续文本到达，好把媒体合并进同一次投递。
+                // 但**不能**只返回「不确定」——那会让核心永远看不见这次投递（零投递告警）。
+                // 用官方的 `finalization` 机制把**最终结果的所有权**交给核心：
+                // 核心会 await 这个承诺，并用 resolve 出的字段覆盖记账。
+                // 结算责任落在 mediaState 的四条出口上（定时器到时 / 被文本合并 /
+                // 无媒可发 / 发送失败）—— 任何一条漏掉都会让核心永久等待。
+                return {
+                    visibleReplySent: false,
+                    finalization: mediaState.beginMediaOnlyDeferral(),
+                };
             }
         }
 

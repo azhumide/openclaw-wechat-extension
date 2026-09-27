@@ -109,20 +109,21 @@ describe("T5 投递回调的诚实返回值契约", () => {
         );
     });
 
-    test("延后发送的分支使用 adapter_returned_no_identity（而非谎称已发）", () => {
+    test("媒体延后投递把最终结果的所有权交给核心（finalization），而非只说不确定", () => {
         const body = deliveryFnBody();
+        // 媒体-only 延后不能只回 adapter_returned_no_identity —— 那只是「不确定」，
+        // 核心永远看不到最终结果（会报零投递告警）。必须给 finalization 承诺。
+        assert.match(
+            body,
+            /finalization:\s*mediaState\.beginMediaOnlyDeferral\(\)/,
+            "媒体延后出口必须返回 { visibleReplySent: false, finalization: <承诺> }，" +
+                "让核心在结算时拿到真实结果",
+        );
+        // 结算责任必须落在 mediaState 内部（四条出口），投递回调这边不自己结算。
         assert.match(
             deliverySource(),
-            /const deferWechatDelivery = \(\)[\s\S]{0,140}?reason:\s*"adapter_returned_no_identity"/,
-            "deferWechatDelivery() 必须以 adapter_returned_no_identity 声明「延后/未确认」",
-        );
-        // 【方案 A 之后】final 路径已改为就地投递，不再延后 → 只剩媒体-only 缓冲一处。
-        // 保留 >=1 的下限：媒体路径若被删除，这条断言会失败，提示重新审计延后语义。
-        const callSites = countMatches(body, /return deferWechatDelivery\(\);/g);
-        assert.ok(
-            callSites >= 1,
-            `预期至少 1 处延后出口（媒体-only 缓冲），实际 ${callSites}；` +
-                `final 路径已于方案 A 改为就地投递，不应再出现在此`,
+            /const suppressWechatDelivery = \(\)[\s\S]{0,120}?reason:\s*"no_visible_result"/,
+            "suppressWechatDelivery() 仍须以 no_visible_result 声明「有意不发」",
         );
     });
 
