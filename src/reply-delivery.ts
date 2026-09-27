@@ -88,6 +88,21 @@ export async function dispatchWechatReplyForInbound(params: {
         upstreamMessageTraceId,
     });
 
+    // P0 契约：投递回调的返回值决定核心如何给本次投递记账
+    // (src/channels/turn/lifecycle.ts 的 settlePendingFinalDelivery)。
+    // 裸 return(undefined) 会被核心记为「已投递」——即使实际什么都没发。
+    // 因此每个出口都必须显式声明自己的语义。
+    const suppressWechatDelivery = (): any => ({
+        visibleReplySent: false,
+        suppression: { reason: "no_visible_result" },
+    });
+    // 延后/未确认：内容将在本回合稍后投递（或投递结果无回执 id）。
+    // 核心把 adapter_returned_no_identity 记为 "unknown"（pending），不计入已投递。
+    const deferWechatDelivery = (): any => ({
+        visibleReplySent: false,
+        suppression: { reason: "adapter_returned_no_identity" },
+    });
+
     const deliverWechatReply = async (...args: any[]) => {
         const bridgeConfig = resolveWechatExtensionConfig(cfg, api.logger);
         const replyAuthContext = {
@@ -127,7 +142,9 @@ export async function dispatchWechatReplyForInbound(params: {
                     `[WeChat] Suppressing final error payload reason=${finalErrorSuppression.reason} ` +
                     `session=${sessionKey} error="${finalErrorPayloadSummary}"`,
                 );
-                return;
+                // 有意不发：工具失败摘要不应作为可见回复。必须显式告知核心，
+                // 裸 return(undefined) 会被核心记为「已投递」。
+                return suppressWechatDelivery();
             }
         }
         if (info.kind === "final" && !finalBuffer.isFlushing) {
@@ -136,7 +153,9 @@ export async function dispatchWechatReplyForInbound(params: {
                 `[WeChat] Buffered final reply until dispatch settles session=${sessionKey} ` +
                 `trace=${replyMediaDispatchId} bufferedFinals=${bufferedFinalReplyCount}`,
             );
-            return;
+            // 延后发送：本回合稍后由 finalBuffer.flush 投递。此刻并未发出任何内容，
+            // 故不得回报成功，否则核心会把「延后」误记为「已投递」。
+            return deferWechatDelivery();
         }
         const usePayloadOnlyText = info.kind === "final" && finalBuffer.isFlushing;
 
@@ -175,7 +194,7 @@ export async function dispatchWechatReplyForInbound(params: {
             bridgeConfig,
         });
         if (fullTextResult.shouldSkip) {
-            return;
+            return suppressWechatDelivery();
         }
         const fullText = fullTextResult.text;
         const blockedReply = typeof sessionKey === "string"
@@ -193,7 +212,7 @@ export async function dispatchWechatReplyForInbound(params: {
             bridgeConfig,
         });
         if (normalizedNewText.shouldSkip) {
-            return;
+            return suppressWechatDelivery();
         }
         newText = normalizedNewText.text;
         const redundantToolFailureSummary = shouldSuppressWechatToolFailureSummary({
@@ -205,7 +224,7 @@ export async function dispatchWechatReplyForInbound(params: {
             api.logger.info(
                 `[WeChat] Skipping redundant tool failure summary stage=incremental reason=${redundantToolFailureSummary.reason} text="${summarizeWechatTextForLog(redactWechatTextForLogs(newText, bridgeConfig), 160)}"`,
             );
-            return;
+            return suppressWechatDelivery();
         }
 
         const extractedBareMedia = extractWechatReplyTextAndBareMedia({
@@ -252,7 +271,7 @@ export async function dispatchWechatReplyForInbound(params: {
                 `[WeChat] Suppressing model reply after tool-auth block sessionKey=${sessionKey} ` +
                 `reason=non-owner-local-file tool=${blockedReply?.toolName || ""} localAttachmentBlocked=true`,
             );
-            return;
+            return suppressWechatDelivery();
         }
 
         const hasNewMedia = mediaState.hasNewMediaCandidates(allMedia);
@@ -263,7 +282,8 @@ export async function dispatchWechatReplyForInbound(params: {
                 api.logger.info(
                     `[WeChat] Buffered media-only block count=${bufferedMediaCount} waitMs=${mediaState.pendingBlockMediaDelayMs}`,
                 );
-                return;
+                // 延后：由 1.2s 定时器或回合末 flush 投递，此刻尚未发出。
+                return deferWechatDelivery();
             }
         }
 
@@ -283,7 +303,7 @@ export async function dispatchWechatReplyForInbound(params: {
             api.logger.info(
                 `[WeChat] Skipping redundant ${info.kind} reply (no new text/media)`,
             );
-            return;
+            return suppressWechatDelivery();
         }
 
         const logText = redactWechatTextForLogs(textToProcess, bridgeConfig).substring(0, 50).replace(/\n/g, "\\n");
@@ -319,6 +339,9 @@ export async function dispatchWechatReplyForInbound(params: {
                 textToProcess,
             });
         }
+
+        // 真实投递已完成：显式回报成功，供核心记账与观察者使用。
+        return { visibleReplySent: true, content: textToProcess };
     };
 
     const baseDispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({

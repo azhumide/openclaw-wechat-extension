@@ -4,7 +4,8 @@
     "description": "OpenClaw WeChat channel plugin",
     "type": "module",
     "scripts": {
-        "build": "npx esbuild index.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outdir=dist"
+        "build": "npx esbuild index.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outdir=dist",
+        "test": "NODE_OPTIONS=\"--import ./tests/helpers/register.mjs\" node --test \"tests/**/*.test.ts\""
     },
     "dependencies": {
         "ws": "^8.18.3"
