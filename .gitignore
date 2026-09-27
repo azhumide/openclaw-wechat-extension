@@ -4,3 +4,6 @@ dist/
 *.log
 .env
 .cache/
+
+# Local bridge settings (contains a live bridgeMediaToken)
+wechat.config.json

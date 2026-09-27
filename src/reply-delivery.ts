@@ -25,6 +25,7 @@ import {
     readWechatReplyIncomingText,
 } from "./reply-text.js";
 import { getWechatBlockedReplyForSession } from "./runtime.js";
+import { renderWechatInteractiveFallback } from "./interactive-fallback.js";
 import {
     redactWechatTextForLogs,
     rewriteWechatNonOwnerAddressing,
@@ -73,6 +74,7 @@ export async function dispatchWechatReplyForInbound(params: {
     let finalErrorPayloadSummary = "";
     let localAttachmentBlockedThisTurn = false;
     let suppressedNaturalReplyAfterAuthBlock = false;
+    let interactiveFallbackSent = false;
     const finalBuffer = createWechatReplyFinalBuffer();
     const replyMediaDispatchId = upstreamMessageTraceId || messageId;
     const mediaState = createWechatReplyMediaState({
@@ -137,6 +139,20 @@ export async function dispatchWechatReplyForInbound(params: {
             return;
         }
         const usePayloadOnlyText = info.kind === "final" && finalBuffer.isFlushing;
+
+        if (!interactiveFallbackSent) {
+            const interactiveText = renderWechatInteractiveFallback({
+                payload,
+                sessionKey,
+                senderId: resolvedSenderId,
+            });
+            if (interactiveText) {
+                interactiveFallbackSent = true;
+                payload.text = interactiveText;
+                payload.presentation = undefined;
+                payload.interactive = undefined;
+            }
+        }
 
         // Track all text seen in this specific turn across all dispatcher calls
         // Read-only here, updates belong to onPartialReply

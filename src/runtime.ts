@@ -25,7 +25,15 @@ interface WeChatBridgeState {
     latestToolAuthByChat: Map<string, WechatToolAuthRecord>;
     blockedReplyBySession: Map<string, WechatBlockedReplyRecord>;
     skillToolSessions: Map<string, WechatSkillToolSessionRecord>;
+    interactiveMenus: Map<string, WechatInteractiveMenu>;
 }
+
+export type WechatInteractiveMenu = {
+    sessionKey: string;
+    senderId: string;
+    items: Array<{ label: string; value: string }>;
+    createdAt: number;
+};
 
 export type WechatToolAuthRecord = {
     sessionKey: string;
@@ -98,6 +106,9 @@ const getGlobalState = (): WeChatBridgeState => {
     }
     if (!(state.skillToolSessions instanceof Map)) {
         state.skillToolSessions = new Map<string, WechatSkillToolSessionRecord>();
+    }
+    if (!(state.interactiveMenus instanceof Map)) {
+        state.interactiveMenus = new Map<string, WechatInteractiveMenu>();
     }
     return state;
 };
@@ -191,6 +202,36 @@ function cleanExpiredToolAuth(now = Date.now()) {
             state.skillToolSessions.delete(sessionId);
         }
     }
+    for (const [sessionKey, entry] of state.interactiveMenus) {
+        if (now - entry.createdAt > 10 * 60 * 1000) {
+            state.interactiveMenus.delete(sessionKey);
+        }
+    }
+}
+
+export function rememberWechatInteractiveMenu(menu: WechatInteractiveMenu) {
+    cleanExpiredToolAuth(menu.createdAt);
+    getGlobalState().interactiveMenus.set(menu.sessionKey.toLowerCase(), menu);
+}
+
+export function consumeWechatInteractiveReply(params: {
+    sessionKey: string;
+    senderId: string;
+    content: string;
+}): { value: string; label: string } | undefined {
+    cleanExpiredToolAuth();
+    const state = getGlobalState();
+    const key = params.sessionKey.trim().toLowerCase();
+    const menu = state.interactiveMenus.get(key);
+    if (!menu || menu.senderId.trim().toLowerCase() !== params.senderId.trim().toLowerCase()) {
+        return undefined;
+    }
+    const match = params.content.trim().match(/^(?:选项\s*)?(\d{1,3})$/i);
+    if (!match) return undefined;
+    const item = menu.items[Number(match[1]) - 1];
+    if (!item) return undefined;
+    state.interactiveMenus.delete(key);
+    return item;
 }
 
 export function enqueueWechatInboundToolAuth(entry: WechatToolAuthRecord) {

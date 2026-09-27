@@ -4,7 +4,7 @@ import { sendWechatToolAuthNotice } from "./dedup.js";
 import { buildWechatInboundContext, buildWechatInboundLogLine } from "./inbound-context.js";
 import { resolveWechatInboundMedia } from "./media.js";
 import { dispatchWechatReplyForInbound } from "./reply-delivery.js";
-import { enqueueWechatInboundToolAuth } from "./runtime.js";
+import { consumeWechatInteractiveReply, enqueueWechatInboundToolAuth } from "./runtime.js";
 import { maybeHandleWechatBlockedSkillIntent } from "./blocked-skill-intent.js";
 
 export const WECHAT_EXTENSION_BUILD_MARKER =
@@ -45,10 +45,25 @@ export async function handleInboundMessage(api: OpenClawPluginApi, body: any): P
             logger: api.logger,
         })
         : {};
-    const inbound = buildWechatInboundContext({
+    let inbound = buildWechatInboundContext({
         body,
         media: resolvedMedia,
     });
+    const selected = !media && typeof content === "string"
+        ? consumeWechatInteractiveReply({
+            sessionKey: inbound.sessionKey,
+            senderId: inbound.resolvedSenderId,
+            content,
+        })
+        : undefined;
+    if (selected) {
+        body.content = selected.value;
+        inbound = buildWechatInboundContext({
+            body,
+            media: resolvedMedia,
+        });
+        api.logger.info(`[WeChat] Interactive selection received: ${selected.label}`);
+    }
     const {
         chatType,
         conversationLabel,
