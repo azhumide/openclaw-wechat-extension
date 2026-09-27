@@ -148,14 +148,18 @@ export async function dispatchWechatReplyForInbound(params: {
             }
         }
         if (info.kind === "final" && !finalBuffer.isFlushing) {
-            const bufferedFinalReplyCount = finalBuffer.buffer(args);
-            api.logger.info(
-                `[WeChat] Buffered final reply until dispatch settles session=${sessionKey} ` +
-                `trace=${replyMediaDispatchId} bufferedFinals=${bufferedFinalReplyCount}`,
-            );
-            // 延后发送：本回合稍后由 finalBuffer.flush 投递。此刻并未发出任何内容，
-            // 故不得回报成功，否则核心会把「延后」误记为「已投递」。
-            return deferWechatDelivery();
+            // 【方案 A】final 就地投递：缓冲本次 final 后**立即**在本次调用栈内 flush。
+            // 真实发送与结果返回都发生在核心结算之前 → 核心拿到真实结果，
+            // 而不是被喂一个「已投递」的假账（旧实现 `buffer + return` 的问题）。
+            //
+            // 合并/去重语义不变：flush 复用原有契约（回调期间 `isFlushing` 为真，
+            // 于是上面的 final 分支被跳过，进入真正的发送逻辑）。
+            //
+            // 不能改用核心的 `finalization`：核心在 dispatchChannelInboundTurn 返回
+            // **之前**就 await 它，而旧 flush 在返回**之后** → 会永久挂死。
+            finalBuffer.buffer(args);
+            const flushedResult = await flushBufferedFinalReply();
+            return flushedResult ?? deferWechatDelivery();
         }
         const usePayloadOnlyText = info.kind === "final" && finalBuffer.isFlushing;
 
@@ -344,6 +348,24 @@ export async function dispatchWechatReplyForInbound(params: {
         return { visibleReplySent: true, content: textToProcess };
     };
 
+    // 【方案 A】把缓冲的 final 就地投递，并把真实结果回传给核心。
+    // 返回 undefined 表示没有待投递内容（flush 未触发回调）。
+    //
+    // 复用的是原有的 `finalBuffer.flush` 契约：它在调用回调期间把 `isFlushing` 置真，
+    // 于是 `deliverWechatReply` 里那个 `info.kind === "final" && !isFlushing` 分支会
+    // 被跳过、转而走真正的发送逻辑（`usePayloadOnlyText` 为真）。合并/去重语义不变。
+    const flushBufferedFinalReply = async (): Promise<any> => {
+        let deliveredResult: any;
+        const flushed = await finalBuffer.flush(async (finalReplyArgs) => {
+            api.logger.info(
+                `[WeChat] Flushing buffered final reply in-call session=${sessionKey} ` +
+                `trace=${replyMediaDispatchId} bufferedFinals=${finalBuffer.count}`,
+            );
+            deliveredResult = await deliverWechatReply(...finalReplyArgs);
+        });
+        return flushed ? deliveredResult : undefined;
+    };
+
     const baseDispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
         onTyping: async () => { },
     } as any);
@@ -400,13 +422,9 @@ export async function dispatchWechatReplyForInbound(params: {
     });
     const dispatchResult = dispatchTurn.dispatchResult;
 
-    await finalBuffer.flush(async (finalReplyArgs) => {
-        api.logger.info(
-            `[WeChat] Flushing preferred buffered final reply session=${sessionKey} ` +
-            `trace=${replyMediaDispatchId} bufferedFinals=${finalBuffer.count}`,
-        );
-        await deliverWechatReply(...finalReplyArgs);
-    });
+    // 【方案 A】回合末不再 flush final：final 已在 `deliverWechatReply` 内就地投递
+    // 并回传真实结果。此处若再 flush 会把投递推迟到核心结算之后（核心看不见），
+    // 且与就地投递重复。
 
     // [Fallback] Flush any remaining buffered media that was never merged into a text reply
     if (mediaState.hasPendingBlockMedia()) {

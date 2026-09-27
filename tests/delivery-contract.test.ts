@@ -116,10 +116,13 @@ describe("T5 投递回调的诚实返回值契约", () => {
             /const deferWechatDelivery = \(\)[\s\S]{0,140}?reason:\s*"adapter_returned_no_identity"/,
             "deferWechatDelivery() 必须以 adapter_returned_no_identity 声明「延后/未确认」",
         );
+        // 【方案 A 之后】final 路径已改为就地投递，不再延后 → 只剩媒体-only 缓冲一处。
+        // 保留 >=1 的下限：媒体路径若被删除，这条断言会失败，提示重新审计延后语义。
         const callSites = countMatches(body, /return deferWechatDelivery\(\);/g);
         assert.ok(
-            callSites >= 2,
-            `预期至少 2 处延后出口（final 缓冲、媒体-only 缓冲），实际 ${callSites}`,
+            callSites >= 1,
+            `预期至少 1 处延后出口（媒体-only 缓冲），实际 ${callSites}；` +
+                `final 路径已于方案 A 改为就地投递，不应再出现在此`,
         );
     });
 
